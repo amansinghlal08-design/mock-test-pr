@@ -1,0 +1,17 @@
+{
+  "name": "MockTest.pro — Timed Mock Tests",
+  "short_name": "MockTest.pro",
+  "description": "Timed mock tests for GK, Maths, English, Reasoning and Science with XP, streaks and weak-question tracking.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#4f46e5",
+  "icons": [
+    {
+      "src": "/logo.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ]
+}
