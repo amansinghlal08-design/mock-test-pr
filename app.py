@@ -42,7 +42,29 @@ EXPORT_PASSWORD = "121520"  # password required to download the question bank
 EXPORT_PASSWORD_HASH = hashlib.sha256(EXPORT_PASSWORD.encode()).hexdigest()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "mocktest.db")
+
+
+def _resolve_db_path():
+    """Pick a writable location for the SQLite database.
+
+    Locally this is mocktest.db next to the script. On hosts like Render
+    the project directory is read-only, so we fall back to /tmp (note:
+    /tmp is wiped whenever the service restarts — see the README notes
+    in the module docstring about persistence).
+    """
+    for base in (BASE_DIR, "/tmp"):
+        candidate = os.path.join(base, "mocktest.db")
+        try:
+            if not os.path.exists(candidate):
+                with open(candidate, "a"):
+                    pass
+            return candidate
+        except OSError:
+            continue
+    return os.path.join(BASE_DIR, "mocktest.db")
+
+
+DB_PATH = _resolve_db_path()
 
 app = Flask(__name__)
 
@@ -1770,12 +1792,21 @@ function fireConfetti() {
 </html>"""
 
 
+# Initialise the database on import so the app works under both
+# `python app.py` and `gunicorn app:app` (how Render starts the app).
+init_db()
+
+
 if __name__ == "__main__":
-    init_db()
     print("=" * 52)
     print("  MockTest.pro — Level 99  (single-file edition)")
     print(f"  Database : {DB_PATH}")
-    print("  Open     : http://127.0.0.1:5000")
+    print(f"  Open     : http://127.0.0.1:{port}")
     print("  Stop     : Ctrl+C")
     print("=" * 52)
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    port = int(os.getenv("PORT", 5000))
+    app.run(
+        host="0.0.0.0",
+        port=port,
+        debug=os.getenv("FLASK_DEBUG", "").lower() in ("1", "true", "yes"),
+    )
