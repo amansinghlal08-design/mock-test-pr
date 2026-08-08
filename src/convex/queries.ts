@@ -148,6 +148,59 @@ export const analytics = query({
   },
 });
 
+/**
+ * Global leaderboard — every registered user ranked by XP, joined with their
+ * lifetime accuracy and test count. The signed-in user's own id is included so
+ * the client can highlight their row.
+ */
+export const leaderboard = query({
+  args: {},
+  handler: async (ctx) => {
+    const userId = await getAuthUserId(ctx);
+
+    const stats = await ctx.db.query("userStats").collect();
+    const rows: {
+      userId: string;
+      name: string;
+      level: number;
+      xp: number;
+      streak: number;
+      tests: number;
+      accuracy: number;
+    }[] = [];
+
+    for (const s of stats) {
+      const u = await ctx.db.get(s.userId);
+      if (!u) continue;
+      const attempts = await ctx.db
+        .query("testAttempts")
+        .withIndex("by_user_ts", (q) => q.eq("userId", s.userId))
+        .collect();
+      const total = attempts.reduce((sum, a) => sum + a.total, 0);
+      const correct = attempts.reduce((sum, a) => sum + a.correct, 0);
+      rows.push({
+        userId: s.userId,
+        name: u.name || (u.email ? u.email.split("@")[0] : "Guest"),
+        level: s.level,
+        xp: s.xp,
+        streak: s.streak,
+        tests: attempts.length,
+        accuracy: total ? Math.round((correct / total) * 1000) / 10 : 0,
+      });
+    }
+
+    rows.sort(
+      (a, b) => b.xp - a.xp || b.level - a.level || b.accuracy - a.accuracy,
+    );
+
+    return {
+      rows: rows.slice(0, 50).map((r, i) => ({ ...r, rank: i + 1 })),
+      myUserId: userId,
+      totalPlayers: rows.length,
+    };
+  },
+});
+
 /** Paginated list of the user's weak questions, worst first. */
 export const weakQuestions = query({
   args: { page: v.optional(v.number()) },

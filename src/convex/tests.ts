@@ -50,6 +50,28 @@ function shuffleOptions(q: Doc<"questions">) {
 
 const DAY = 86_400_000;
 
+/** Auto-chunk size for topic tests (exactly 20 questions per chunk). */
+export const CHUNK_SIZE = 20;
+
+/** Access key that unlocks question-bank import/export. Kept out of the UI. */
+const ACCESS_KEY = "121520";
+
+/** SHA-256 hex digest (Web Crypto — available in the Convex Node runtime). */
+async function sha256Hex(input: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(input),
+  );
+  return Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
+async function hasAccessKey(candidate: string): Promise<boolean> {
+  if (!candidate) return false;
+  return (await sha256Hex(candidate)) === (await sha256Hex(ACCESS_KEY));
+}
+
 /**
  * Seed the starter question bank if the table is empty. Idempotent — safe to
  * call on every dashboard mount.
@@ -81,6 +103,10 @@ export const startTest = mutation({
     topic: v.optional(v.string()),
     mode: testModeValidator,
     limit: v.number(),
+    // Auto-chunked topic tests: `chunk` is the 1-based test number (Test 1,
+    // Test 2, …) and `chunkSize` the questions per chunk (default 20).
+    chunk: v.optional(v.number()),
+    chunkSize: v.optional(v.number()),
   },
   returns: v.union(
     v.object({ ok: v.literal(false), error: v.string() }),
@@ -109,7 +135,18 @@ export const startTest = mutation({
           qq.eq("category", args.category ?? "").eq("topic", args.topic!),
         )
         .collect();
-      if (picked.length < args.limit) {
+      if (args.chunk) {
+        // Chunked test: take the exact chunk of insertion-ordered questions.
+        const size = Math.max(1, args.chunkSize ?? CHUNK_SIZE);
+        const start = (args.chunk - 1) * size;
+        picked = picked.slice(start, start + size);
+        if (picked.length === 0) {
+          return {
+            ok: false as const,
+            error: "That test set doesn't exist yet.",
+          };
+        }
+      } else if (picked.length < args.limit) {
         return {
           ok: false as const,
           error: `Only ${picked.length} questions here — pick a smaller test or another topic.`,
@@ -146,7 +183,8 @@ export const startTest = mutation({
       picked = fetched;
     }
 
-    picked = shuffle(picked).slice(0, args.limit);
+    picked = shuffle(picked);
+    picked = picked.slice(0, args.chunk ? picked.length : args.limit);
     if (picked.length === 0) {
       return { ok: false as const, error: "No questions found." };
     }
@@ -316,6 +354,117 @@ export const clearWeakQuestions = mutation({
     for (const w of weaks) {
       await ctx.db.delete(w._id);
     }
+  },
+});
+
+/**
+ * Bulk-import questions under a specific category + destination topic.
+ *
+ * Requires the secret access key. Duplicate question text is skipped entirely
+ * (only brand-new questions are inserted), so double-importing is harmless.
+ * Entries may carry their own category/topic to override the destination.
+ */
+export const importQuestions = mutation({
+  args: {
+    password: v.string(),
+    category: v.string(),
+    topic: v.string(),
+    questions: v.array(
+      v.object({
+        question: v.string(),
+        options: v.array(v.string()),
+        correct: v.number(),
+        explanation: v.optional(v.string()),
+        category: v.optional(v.string()),
+        topic: v.optional(v.string()),
+      }),
+    ),
+  },
+  returns: v.object({
+    ok: v.boolean(),
+    imported: v.number(),
+    duplicates: v.number(),
+    skipped: v.number(),
+    total: v.number(),
+  }),
+  handler: async (ctx, args) => {
+    const userId = await getAuthUserId(ctx);
+    if (userId === null) throw new Error("Please sign in.");
+    if (!(await hasAccessKey(args.password))) {
+      return { ok: false, imported: 0, duplicates: 0, skipped: args.questions.length, total: args.questions.length };
+    }
+
+    const existing = await ctx.db.query("questions").collect();
+    const seen = new Set(existing.map((q) => q.question));
+
+    let imported = 0;
+    let duplicates = 0;
+    let skipped = 0;
+
+    for (const q of args.questions) {
+      const text = (q.question ?? "").trim();
+      const options = (q.options ?? []).filter((o) => typeof o === "string" && o.trim());
+      if (!text || options.length < 2 || !Number.isInteger(q.correct) || q.correct < 0 || q.correct >= options.length) {
+        skipped++;
+        continue;
+      }
+      if (seen.has(text)) {
+        duplicates++;
+        continue;
+      }
+      await ctx.db.insert("questions", {
+        category: q.category || args.category,
+        topic: q.topic || args.topic,
+        question: text,
+        options: options.slice(0, 4),
+        correct: q.correct,
+        explanation: q.explanation ?? "",
+      });
+      seen.add(text);
+      imported++;
+    }
+
+    return { ok: true, imported, duplicates, skipped, total: args.questions.length };
+  },
+});
+
+/**
+ * Export the full question bank as JSON. Protected by the same secret key;
+ * returns every question (with category/topic) so a re-import round-trips.
+ */
+export const exportQuestions = mutation({
+  args: { password: v.string() },
+  returns: v.object({
+    ok: v.boolean(),
+    questions: v.array(
+      v.object({
+        category: v.string(),
+        topic: v.string(),
+        question: v.string(),
+        options: v.array(v.string()),
+        correct: v.number(),
+        explanation: v.string(),
+      }),
+    ),
+  }),
+  handler: async (ctx, args) => {
+    const userId = await getAuthUserId(ctx);
+    if (userId === null) throw new Error("Please sign in.");
+    if (!(await hasAccessKey(args.password))) {
+      return { ok: false, questions: [] };
+    }
+    const all = await ctx.db.query("questions").collect();
+    return {
+      ok: true,
+      questions: all.map((q) => ({
+        category: q.category,
+        topic: q.topic,
+        question: q.question,
+        options: q.options,
+        correct: q.correct,
+        explanation: q.explanation,
+      })),
+    };
   },
 });
 

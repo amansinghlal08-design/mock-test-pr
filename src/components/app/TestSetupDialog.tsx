@@ -23,6 +23,11 @@ export function TestSetupDialog({ open, onOpenChange, config, available, onConfi
     if (!open || !config) return;
     setMode(config.mode);
     const max = Math.max(1, available ?? 20);
+    if (config.chunk) {
+      // Chunked tests always use the exact chunk size — no other options.
+      setLimit(max);
+      return;
+    }
     const clamped = Math.min(max, 20);
     setLimit(
       LIMITS.includes(clamped)
@@ -36,6 +41,7 @@ export function TestSetupDialog({ open, onOpenChange, config, available, onConfi
   if (!config) return null;
 
   const isDrill = config.mode === "weak" || config.mode === "hard";
+  const isChunk = !!config.chunk;
   const max = Math.max(1, available ?? 50);
   const options =
     max < LIMITS[0]
@@ -50,7 +56,9 @@ export function TestSetupDialog({ open, onOpenChange, config, available, onConfi
 
   const headline =
     config.mode === "normal"
-      ? `${config.topic ?? "Topic"} test`
+      ? isChunk
+        ? `${config.topic ?? "Topic"} · Test ${config.chunk}`
+        : `${config.topic ?? "Topic"} test`
       : config.mode === "all"
         ? `Full ${config.category ?? "category"} mock`
         : config.mode === "hard"
@@ -59,7 +67,9 @@ export function TestSetupDialog({ open, onOpenChange, config, available, onConfi
 
   const desc =
     config.mode === "normal"
-      ? `Timed test from “${config.topic}” with instant answers & explanations.`
+      ? isChunk
+        ? `Test ${config.chunk} of the “${config.topic}” bank — exactly ${safeLimit} fixed questions.`
+        : `Timed test from “${config.topic}” with instant answers & explanations.`
       : config.mode === "all"
         ? `Every question in ${config.category ?? "the category"}, shuffled. The full exam experience.`
         : config.mode === "hard"
@@ -78,22 +88,29 @@ export function TestSetupDialog({ open, onOpenChange, config, available, onConfi
         </DialogHeader>
 
         <div className="space-y-4">
-          <div>
-            <label className="mb-1.5 block text-sm font-semibold">
-              Number of questions
-            </label>
-            <select
-              value={shown}
-              onChange={(e) => setLimit(Number(e.target.value))}
-              className="h-11 w-full rounded-xl border bg-background px-3 text-sm font-medium outline-none transition-[border,box-shadow] focus:border-primary focus:ring-3 focus:ring-primary/20"
-            >
-              {options.map((o) => (
-                <option key={o.value} value={o.value}>
-                  {o.label}
-                </option>
-              ))}
-            </select>
-          </div>
+          {isChunk ? (
+            <div className="flex items-center gap-2 rounded-xl bg-indigo-500/10 px-3.5 py-2.5 text-xs font-bold text-indigo-600 dark:text-indigo-300">
+              <SlidersHorizontal className="size-4 shrink-0" />
+              Test {config.chunk} · {safeLimit} fixed questions
+            </div>
+          ) : (
+            <div>
+              <label className="mb-1.5 block text-sm font-semibold">
+                Number of questions
+              </label>
+              <select
+                value={shown}
+                onChange={(e) => setLimit(Number(e.target.value))}
+                className="h-11 w-full rounded-xl border bg-background px-3 text-sm font-medium outline-none transition-[border,box-shadow] focus:border-primary focus:ring-3 focus:ring-primary/20"
+              >
+                {options.map((o) => (
+                  <option key={o.value} value={o.value}>
+                    {o.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
 
           <div>
             <label className="mb-1.5 block text-sm font-semibold">Mode</label>

@@ -21,6 +21,8 @@ export interface ActiveTest {
   mode: string;
   category: string;
   topic: string;
+  /** 1-based auto-chunk index, when this test is one chunk of a topic. */
+  chunk?: number;
 }
 
 /** Result payload from submitTest. */
@@ -42,10 +44,12 @@ export type View =
   | "home"
   | "subjects"
   | "topics"
+  | "chunks"
   | "test"
   | "result"
   | "weak"
-  | "analytics";
+  | "analytics"
+  | "leaderboard";
 
 export type TestMode = "normal" | "all" | "weak" | "hard";
 
@@ -53,7 +57,12 @@ export interface TestConfig {
   mode: TestMode;
   category?: string;
   topic?: string;
+  /** 1-based auto-chunk index for chunked topic tests (Test 1, Test 2, …). */
+  chunk?: number;
 }
+
+/** Questions per auto-generated chunk (must match the backend constant). */
+export const CHUNK_SIZE = 20;
 
 export const MODE_LABELS: Record<TestMode, string> = {
   normal: "Topic test",

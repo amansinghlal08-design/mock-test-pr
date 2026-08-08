@@ -1,18 +1,19 @@
 import { api } from "@/convex/_generated/api";
 import { useQuery } from "convex/react";
 import { motion } from "framer-motion";
-import { ArrowLeft, Layers, ListChecks, Sparkles } from "lucide-react";
+import { ArrowLeft, ArrowRight, Layers, ListChecks, Sparkles } from "lucide-react";
 import { subjectMeta } from "@/lib/test";
 import { Skeleton } from "@/components/ui/skeleton";
 
 interface TopicsViewProps {
   category: string;
   onBack: () => void;
-  onStartTopic: (topic: string, count: number) => void;
+  /** Route into the auto-chunked test picker for this topic. */
+  onOpenTopic: (topic: string, count: number) => void;
   onStartAll: () => void;
 }
 
-export function TopicsView({ category, onBack, onStartTopic, onStartAll }: TopicsViewProps) {
+export function TopicsView({ category, onBack, onOpenTopic, onStartAll }: TopicsViewProps) {
   const topics = useQuery(api.queries.topics, { category });
   const meta = subjectMeta(category);
   const totalCount = topics?.reduce((sum, t) => sum + t.count, 0) ?? 0;
@@ -79,7 +80,7 @@ export function TopicsView({ category, onBack, onStartTopic, onStartAll }: Topic
               initial={{ opacity: 0, y: 14 }}
               animate={{ opacity: 1, y: 0 }}
               transition={{ delay: i * 0.05, duration: 0.35 }}
-              onClick={() => onStartTopic(t.topic, t.count)}
+              onClick={() => onOpenTopic(t.topic, t.count)}
               className="group rounded-3xl border bg-card p-5 text-left shadow-sm transition-all hover:-translate-y-1 hover:border-primary/40 hover:shadow-lg"
             >
               <div className="flex items-start justify-between gap-3">
@@ -89,8 +90,8 @@ export function TopicsView({ category, onBack, onStartTopic, onStartAll }: Topic
               <p className="mt-1 text-sm text-muted-foreground">
                 {t.count} questions · {Math.max(1, Math.ceil(t.count / 2))} min
               </p>
-              <span className="mt-3 inline-block text-sm font-bold text-primary opacity-0 transition-opacity group-hover:opacity-100">
-                Start test →
+              <span className="mt-3 inline-flex items-center gap-1 text-sm font-bold text-primary opacity-0 transition-opacity group-hover:opacity-100">
+                Pick a test <ArrowRight className="size-4" />
               </span>
             </motion.button>
           ))}

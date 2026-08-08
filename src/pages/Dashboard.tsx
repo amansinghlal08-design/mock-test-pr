@@ -7,7 +7,10 @@ import {
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import { AnalyticsView } from "@/components/app/AnalyticsView";
+import { ChunksView } from "@/components/app/ChunksView";
 import { HomeView } from "@/components/app/HomeView";
+import { ImportExportDialog } from "@/components/app/ImportExportDialog";
+import { LeaderboardView } from "@/components/app/LeaderboardView";
 import { ResultView } from "@/components/app/ResultView";
 import { SubjectsView } from "@/components/app/SubjectsView";
 import { TestSetupDialog } from "@/components/app/TestSetupDialog";
@@ -21,6 +24,7 @@ import { AnimatePresence, motion } from "framer-motion";
 import {
   BarChart3,
   BookOpen,
+  Database,
   Flame,
   Home,
   LogOut,
@@ -38,6 +42,7 @@ const NAV_ITEMS: { view: View; label: string; icon: typeof Home }[] = [
   { view: "subjects", label: "Test", icon: BookOpen },
   { view: "weak", label: "Weak", icon: Flame },
   { view: "analytics", label: "Stats", icon: BarChart3 },
+  { view: "leaderboard", label: "Rank", icon: Trophy },
 ];
 
 export default function Dashboard() {
@@ -50,6 +55,11 @@ export default function Dashboard() {
 
   const [view, setView] = useState<View>("home");
   const [selectedCategory, setSelectedCategory] = useState<string | null>(null);
+  const [selectedTopic, setSelectedTopic] = useState<{
+    topic: string;
+    count: number;
+  } | null>(null);
+  const [bankOpen, setBankOpen] = useState(false);
   const [config, setConfig] = useState<TestConfig | null>(null);
   const [configAvailable, setConfigAvailable] = useState(20);
   const [configOpen, setConfigOpen] = useState(false);
@@ -92,6 +102,8 @@ export default function Dashboard() {
           topic: cfg.topic,
           mode: cfg.mode,
           limit,
+          chunk: cfg.chunk,
+          chunkSize: 20,
         });
         if (!res.ok) {
           toast.error(res.error);
@@ -106,6 +118,7 @@ export default function Dashboard() {
           mode: res.mode,
           category: cfg.category ?? res.questions[0]?.category ?? "Mixed",
           topic: cfg.topic ?? "",
+          chunk: cfg.chunk,
         });
         setSummary(null);
         setView("test");
@@ -173,7 +186,14 @@ export default function Dashboard() {
     if (t.mode === "weak" || t.mode === "hard") {
       openConfig({ mode: t.mode as "weak" | "hard" });
     } else if (t.mode === "normal" && t.topic) {
-      openConfig({ mode: "normal", category: t.category, topic: t.topic });
+      if (t.chunk) {
+        openConfig(
+          { mode: "normal", category: t.category, topic: t.topic, chunk: t.chunk },
+          20,
+        );
+      } else {
+        openConfig({ mode: "normal", category: t.category, topic: t.topic });
+      }
     } else {
       openConfig({ mode: "all", category: t.category });
     }
@@ -203,14 +223,38 @@ export default function Dashboard() {
     },
     [openConfig, stats],
   );
-  const startTopic = (topic: string, count: number) =>
-    openConfig({ mode: "normal", category: selectedCategory ?? undefined, topic }, count);
+  const openTopic = (topic: string, count: number) => {
+    setSelectedTopic({ topic, count });
+    setView("chunks");
+  };
+  const startChunk = (chunkIndex: number, size: number) =>
+    openConfig(
+      {
+        mode: "normal",
+        category: selectedCategory ?? undefined,
+        topic: selectedTopic?.topic,
+        chunk: chunkIndex,
+      },
+      size,
+    );
+  const startFullTopic = () => {
+    if (!selectedTopic) return;
+    openConfig(
+      {
+        mode: "normal",
+        category: selectedCategory ?? undefined,
+        topic: selectedTopic.topic,
+      },
+      selectedTopic.count,
+    );
+  };
   const startAll = () =>
     openConfig({ mode: "all", category: selectedCategory ?? undefined });
 
   const goTo = (next: View) => {
     if (next === "subjects") {
       setSelectedCategory(null);
+      setSelectedTopic(null);
       setView("subjects");
     } else {
       setView(next);
@@ -260,6 +304,14 @@ export default function Dashboard() {
           </nav>
 
           <div className="flex items-center gap-2.5">
+            <button
+              onClick={() => goTo("leaderboard")}
+              className="hidden size-8 items-center justify-center rounded-full border bg-card transition-all hover:-translate-y-0.5 hover:border-amber-400/60 hover:shadow-md sm:inline-flex"
+              aria-label="Leaderboard"
+              title="Leaderboard"
+            >
+              <Trophy className="size-4 text-amber-500" />
+            </button>
             <span className="hidden items-center gap-1.5 rounded-full border bg-card px-3 py-1.5 text-xs font-bold sm:inline-flex">
               <Trophy className="size-3.5 text-amber-500" />
               Level {stats?.level ?? 1}
@@ -292,6 +344,10 @@ export default function Dashboard() {
                 <DropdownMenuItem onClick={goHome} className="cursor-pointer">
                   <Home className="mr-2 size-4" /> Home
                 </DropdownMenuItem>
+                <DropdownMenuItem onClick={() => setBankOpen(true)} className="cursor-pointer">
+                  <Database className="mr-2 size-4" /> Manage question bank
+                </DropdownMenuItem>
+                <DropdownMenuSeparator />
                 <DropdownMenuItem
                   onClick={handleSignOut}
                   className="cursor-pointer text-destructive focus:text-destructive"
@@ -354,8 +410,19 @@ export default function Dashboard() {
               <TopicsView
                 category={selectedCategory}
                 onBack={goSubjects}
-                onStartTopic={startTopic}
+                onOpenTopic={openTopic}
                 onStartAll={startAll}
+              />
+            </motion.div>
+          ) : view === "chunks" && selectedCategory && selectedTopic ? (
+            <motion.div key="chunks" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+              <ChunksView
+                category={selectedCategory}
+                topic={selectedTopic.topic}
+                count={selectedTopic.count}
+                onBack={() => setView("topics")}
+                onStartChunk={startChunk}
+                onStartFull={startFullTopic}
               />
             </motion.div>
           ) : view === "weak" ? (
@@ -368,6 +435,10 @@ export default function Dashboard() {
           ) : view === "analytics" ? (
             <motion.div key="analytics" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
               <AnalyticsView onBack={goHome} />
+            </motion.div>
+          ) : view === "leaderboard" ? (
+            <motion.div key="leaderboard" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+              <LeaderboardView onBack={goHome} />
             </motion.div>
           ) : (
             <motion.div key="home" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
@@ -392,14 +463,17 @@ export default function Dashboard() {
         onConfirm={handleConfirmConfig}
       />
 
+      {/* ================= QUESTION BANK (IMPORT/EXPORT) ================= */}
+      <ImportExportDialog open={bankOpen} onOpenChange={setBankOpen} />
+
       {/* ================= MOBILE BOTTOM NAV ================= */}
       {view !== "test" && (
         <nav className="fixed inset-x-0 bottom-0 z-40 border-t bg-background/90 pb-[env(safe-area-inset-bottom)] backdrop-blur-lg md:hidden">
           <div className="flex items-stretch justify-around">
             {NAV_ITEMS.map((n) => {
               const active =
-                n.view === "subjects" || n.view === "topics"
-                  ? view === "subjects" || view === "topics"
+                n.view === "subjects" || n.view === "topics" || n.view === "chunks"
+                  ? view === "subjects" || view === "topics" || view === "chunks"
                   : view === n.view;
               return (
                 <button
