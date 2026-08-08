@@ -20,7 +20,8 @@ How to run
   -> open http://127.0.0.1:5000
 
 Everything is stored in mocktest.db next to this file. No accounts, no API
-keys, works offline. The export password is EXPORT_PASSWORD below.
+keys, works offline. Protected actions (import / export) are gated by a secret
+access code, defined privately in MASTER_CODE below.
 """
 
 import json
@@ -39,8 +40,8 @@ except ImportError:
         "Flask is not installed. Run:  pip install flask"
     )
 
-EXPORT_PASSWORD = "121520"  # password required to download the question bank
-EXPORT_PASSWORD_HASH = hashlib.sha256(EXPORT_PASSWORD.encode()).hexdigest()
+MASTER_CODE = "121520"  # secret access code for protected admin actions (import / export)
+MASTER_CODE_HASH = hashlib.sha256(MASTER_CODE.encode()).hexdigest()
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
@@ -398,29 +399,81 @@ def get_topics():
     return jsonify([{"topic": r["topic"], "count": r["n"]} for r in rows])
 
 
+@app.route("/api/tests")
+def get_tests():
+    """Auto-chunk a topic into exact 20-question tests (Test 1, Test 2, ...)."""
+    category = request.args.get("category")
+    topic = request.args.get("topic")
+    if not category or not topic:
+        return jsonify(error="Missing category or topic"), 400
+    chunk_size = 20
+    with closing(get_db()) as db:
+        rows = db.execute(
+            "SELECT id FROM questions WHERE category=? AND topic=? ORDER BY id",
+            (category, topic),
+        ).fetchall()
+    total = len(rows)
+    if not total:
+        return jsonify(error="No questions in this topic yet."), 404
+    tests = []
+    for i in range(0, total, chunk_size):
+        n = i // chunk_size + 1
+        count = min(chunk_size, total - i)
+        tests.append({
+            "n": n, "count": count,
+            "from": i + 1, "to": i + count,
+            "timer_sec": max(60, count * 30),
+        })
+    return jsonify(
+        category=category, topic=topic, total=total,
+        tests=tests, full_timer_sec=max(60, total * 30),
+    )
+
+
 @app.route("/api/start-test", methods=["POST"])
 def start_test():
     data = request.get_json(force=True) or {}
     username = (data.get("username") or "guest").strip()
     category = data.get("category")
     topic = data.get("topic")
-    mode = data.get("mode", "normal")
+    mode = data.get("mode", "chunk")
+    chunk = int(data.get("chunk", 1))
     limit = int(data.get("limit", 20))
+    chunk_size = 20
 
     with closing(get_db()) as db:
-        if mode == "normal":
+        chunk_ctx = {}
+        if mode in ("chunk", "normal"):
+            # Deterministic 20-question window inside the topic.
+            if not topic:
+                return jsonify(error="Pick a topic first."), 400
+            rows = db.execute(
+                "SELECT * FROM questions WHERE category=? AND topic=? ORDER BY id",
+                (category or "", topic),
+            ).fetchall()
+            if not rows:
+                return jsonify(error="No questions in this topic yet."), 404
+            total_chunks = max(1, (len(rows) + chunk_size - 1) // chunk_size)
+            if chunk < 1 or chunk > total_chunks:
+                return jsonify(error="That test doesn't exist."), 400
+            rows = rows[(chunk - 1) * chunk_size: chunk * chunk_size]
+            chunk_ctx = {"chunk": chunk, "total_chunks": total_chunks}
+            per_q = 30
+        elif mode == "full_topic":
             if not topic:
                 return jsonify(error="Pick a topic first."), 400
             rows = db.execute(
                 "SELECT * FROM questions WHERE category=? AND topic=?",
                 (category or "", topic),
             ).fetchall()
-            if len(rows) < limit:
-                return jsonify(error=f"Only {len(rows)} questions here — pick a smaller test."), 400
+            random.shuffle(rows)
+            per_q = 30
         elif mode == "all":
             rows = db.execute(
                 "SELECT * FROM questions WHERE category=?", (category or "",)
             ).fetchall()
+            random.shuffle(rows)
+            per_q = 30
         elif mode in ("weak", "hard"):
             min_wrong = 2 if mode == "hard" else 1
             rows = db.execute(
@@ -432,19 +485,21 @@ def start_test():
                 msg = ("Nothing to drill yet — no questions missed twice." if mode == "hard"
                        else "No weak questions yet — take a test first!")
                 return jsonify(error=msg), 404
+            random.shuffle(rows)
+            rows = rows[:limit]
+            per_q = 60
         else:
             return jsonify(error="Unknown mode"), 400
 
-        random.shuffle(rows)
-        rows = rows[:limit]
         if not rows:
             return jsonify(error="No questions found."), 404
 
         questions = [shuffle_options(r) for r in rows]
-        per_q = 60 if mode in ("weak", "hard") else 30
         timer_sec = max(60, len(questions) * per_q)
 
-    return jsonify(questions=questions, timer_sec=timer_sec, mode=mode)
+    resp = {"questions": questions, "timer_sec": timer_sec, "mode": mode}
+    resp.update(chunk_ctx)
+    return jsonify(**resp)
 
 
 @app.route("/api/submit-test", methods=["POST"])
@@ -649,54 +704,49 @@ def delete_question(qid):
 @app.route("/api/import-questions", methods=["POST"])
 def import_questions():
     data = request.get_json(force=True) or {}
-    category = data.get("category", "GK")
-    auto_split = data.get("auto_split", True)
+    # Protected action: the secret access code is required.
+    if hashlib.sha256(str(data.get("password", "")).encode()).hexdigest() != MASTER_CODE_HASH:
+        return jsonify(error="Invalid access code"), 401
+
+    category = (data.get("category") or "GK").strip()
+    topic = (data.get("topic") or "").strip()
+    if not topic:
+        return jsonify(error="Choose a destination topic first"), 400
+
     qlist = data.get("questions", [])
     if not qlist:
         return jsonify(error="No questions provided"), 400
     for q in qlist:
         if not all(k in q for k in ("question", "options", "correct")):
             return jsonify(error="Invalid question format — need question, options, correct"), 400
-        if len(q["options"]) != 4:
+        if not isinstance(q.get("options"), list) or len(q["options"]) != 4:
             return jsonify(error="Each question must have exactly 4 options"), 400
 
     with closing(get_db()) as db:
-        existing = db.execute(
-            "SELECT topic FROM questions WHERE category=? AND topic LIKE 'Test %'", (category,)
-        ).fetchall()
-        max_test = 0
-        for r in existing:
-            try:
-                max_test = max(max_test, int(r["topic"].replace("Test ", "")))
-            except ValueError:
-                pass
-
+        # Strict duplicate prevention: the exact question text must not already exist.
+        existing = {r["question"].strip() for r in db.execute("SELECT question FROM questions").fetchall()}
         added = 0
-        if auto_split:
-            for i in range(0, len(qlist), 20):
-                chunk = qlist[i:i + 20]
-                topic = f"Test {max_test + (i // 20) + 1}"
-                for q in chunk:
-                    db.execute(
-                        "INSERT INTO questions (category, topic, question, options, correct, explanation)"
-                        " VALUES (?,?,?,?,?,?)",
-                        (category, topic, q["question"],
-                         json.dumps(q["options"], ensure_ascii=False),
-                         int(q["correct"]), q.get("explanation", "")),
-                    )
-                    added += 1
-        else:
-            for q in qlist:
-                db.execute(
-                    "INSERT INTO questions (category, topic, question, options, correct, explanation)"
-                    " VALUES (?,?,?,?,?,?)",
-                    (category, q.get("topic", "Imported"), q["question"],
-                     json.dumps(q["options"], ensure_ascii=False),
-                     int(q["correct"]), q.get("explanation", "")),
-                )
-                added += 1
+        duplicates = 0
+        for q in qlist:
+            text = str(q["question"]).strip()
+            if not text or text in existing:
+                duplicates += 1
+                continue
+            db.execute(
+                "INSERT INTO questions (category, topic, question, options, correct, explanation)"
+                " VALUES (?,?,?,?,?,?)",
+                (category, topic, text,
+                 json.dumps(q["options"], ensure_ascii=False),
+                 int(q["correct"]), q.get("explanation", "")),
+            )
+            existing.add(text)
+            added += 1
         db.commit()
-    return jsonify(status="ok", added=added)
+
+    # New questions get higher ids, so they naturally fill the topic's incomplete
+    # 20-question test first, then roll into new sequential tests (see /api/tests).
+    return jsonify(status="ok", added=added, duplicates=duplicates,
+                   category=category, topic=topic)
 
 
 @app.route("/api/clear-all", methods=["DELETE"])
@@ -712,7 +762,7 @@ def clear_all_questions():
 def export_all():
     data = request.get_json(force=True) or {}
     password = data.get("password", "")
-    if hashlib.sha256(password.encode()).hexdigest() != EXPORT_PASSWORD_HASH:
+    if hashlib.sha256(str(password).encode()).hexdigest() != MASTER_CODE_HASH:
         return jsonify(error="Invalid password"), 401
     with closing(get_db()) as db:
         rows = db.execute("SELECT * FROM questions ORDER BY id").fetchall()
@@ -734,7 +784,7 @@ def github_sync():
     """Push or pull the question bank + user data via the sync.py bridge."""
     data = request.get_json(force=True) or {}
     action = data.get("action", "backup")
-    if data.get("password", "") != EXPORT_PASSWORD:
+    if data.get("password", "") != MASTER_CODE:
         return jsonify(error="Invalid password"), 401
     if sync is None or not sync.configured():
         return jsonify(error="GitHub sync not configured. Set GITHUB_TOKEN and GITHUB_REPO in Render -> Environment."), 400
@@ -765,156 +815,248 @@ HTML = """<!DOCTYPE html>
 <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
 <style>
 :root{
-  --bg:#f5f6fb; --card:#ffffff; --sunk:#eef0f8; --text:#1c2135; --text2:#5b6170; --muted:#8a90a3;
-  --line:#e4e7f0; --line2:#cbd0e0; --brand:#4f46e5; --brand2:#8b5cf6; --accent:#f59e0b;
-  --ok:#10b981; --oksoft:#d1fae5; --err:#ef4444; --errsoft:#fee2e2; --warn:#f59e0b; --warnsoft:#fef3c7;
-  --shadow:0 1px 3px #1c213510,0 1px 2px #1c21350a;
-  --shadowMd:0 4px 14px #1c213510; --shadowLg:0 14px 40px #1c21351a;
-  --radius:16px; --font:'Plus Jakarta Sans',sans-serif; --mono:'JetBrains Mono',monospace;
+  --bg:#f1f2fb;
+  --card:rgba(255,255,255,.74);
+  --card-solid:#ffffff;
+  --sunk:rgba(23,27,60,.05);
+  --text:#10142b;
+  --text2:#565d7a;
+  --muted:#8b90a8;
+  --line:rgba(23,27,60,.09);
+  --line2:rgba(23,27,60,.18);
+  --brand:#4f46e5;
+  --brand2:#8b5cf6;
+  --brand3:#d946ef;
+  --accent:#f59e0b;
+  --ok:#10b981; --oksoft:rgba(16,185,129,.13);
+  --err:#ef4444; --errsoft:rgba(239,68,68,.12);
+  --warn:#f59e0b; --warnsoft:rgba(245,158,11,.14);
+  --grad-brand:linear-gradient(135deg,#6366f1,#8b5cf6 55%,#c026d3);
+  --grad-amber:linear-gradient(135deg,#f59e0b,#f97316);
+  --grad-mint:linear-gradient(135deg,#10b981,#06b6d4);
+  --grad-red:linear-gradient(135deg,#ef4444,#f97316);
+  --grad-pink:linear-gradient(135deg,#8b5cf6,#ec4899);
+  --grad-blue:linear-gradient(135deg,#06b6d4,#3b82f6);
+  --shadow:0 1px 2px rgba(16,20,43,.05);
+  --shadowMd:0 1px 2px rgba(16,20,43,.04),0 10px 24px -8px rgba(16,20,43,.10);
+  --shadowLg:0 2px 4px rgba(16,20,43,.04),0 18px 36px -12px rgba(16,20,43,.14),0 40px 80px -24px rgba(79,70,229,.18);
+  --shadowGlow:0 10px 30px -8px rgba(99,102,241,.45);
+  --radius:16px;
+  --ease:cubic-bezier(.22,1,.36,1);
+  --pop:cubic-bezier(.2,.9,.25,1.15);
+  --font:'Plus Jakarta Sans',system-ui,-apple-system,'Segoe UI',sans-serif;
+  --mono:'JetBrains Mono',ui-monospace,'SF Mono',monospace;
 }
 [data-theme="dark"]{
-  --bg:#0f1224; --card:#1a1e33; --sunk:#151830; --text:#eef0f8; --text2:#b3b8cb; --muted:#7c8196;
-  --line:#272b41; --line2:#3a3f5c; --brand:#818cf8; --brand2:#a78bfa; --accent:#fbbf24;
-  --ok:#34d399; --oksoft:rgba(52,211,153,.15); --err:#f87171; --errsoft:rgba(248,113,113,.15);
-  --warnsoft:rgba(251,191,36,.15);
+  --bg:#080b1a;
+  --card:rgba(22,26,48,.68);
+  --card-solid:#161a30;
+  --sunk:rgba(255,255,255,.055);
+  --text:#eef0f8;
+  --text2:#aab0c6;
+  --muted:#6f7590;
+  --line:rgba(255,255,255,.09);
+  --line2:rgba(255,255,255,.18);
+  --brand:#818cf8; --brand2:#a78bfa; --brand3:#e879f9;
+  --ok:#34d399; --err:#f87171;
+  --shadow:0 1px 2px rgba(0,0,0,.3);
+  --shadowMd:0 1px 2px rgba(0,0,0,.3),0 12px 28px -10px rgba(0,0,0,.5);
+  --shadowLg:0 2px 4px rgba(0,0,0,.3),0 20px 40px -14px rgba(0,0,0,.55),0 48px 90px -30px rgba(0,0,0,.65);
+  --shadowGlow:0 10px 32px -8px rgba(129,140,248,.35);
 }
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
-body{font-family:var(--font);background:var(--bg);color:var(--text);min-height:100vh;line-height:1.5;transition:background .3s,color .3s;overflow-x:hidden}
+html{scroll-behavior:smooth}
+body{font-family:var(--font);background:var(--bg);color:var(--text);min-height:100vh;line-height:1.55;overflow-x:hidden;transition:background .45s var(--ease),color .45s var(--ease);-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+body::before{content:"";position:fixed;inset:0;z-index:0;pointer-events:none;background-image:radial-gradient(rgba(23,27,60,.06) 1px,transparent 1.5px);background-size:26px 26px;-webkit-mask-image:radial-gradient(1200px 800px at 50% 0%,#000 30%,transparent 78%);mask-image:radial-gradient(1200px 800px at 50% 0%,#000 30%,transparent 78%)}
+[data-theme="dark"] body::before{background-image:radial-gradient(rgba(255,255,255,.05) 1px,transparent 1.5px)}
 .container{width:100%;max-width:1080px;margin:0 auto;padding:0 16px;position:relative;z-index:2}
-button{font-family:inherit;cursor:pointer;border:0;background:none;color:inherit;transition:transform .1s ease,background .2s,border-color .2s,color .2s}
-button:active{transform:scale(.96)}
-input,textarea,select{font-family:inherit;font-size:16px;color:var(--text);width:100%}
+button{font-family:inherit;cursor:pointer;border:0;background:none;color:inherit}
+input,textarea,select{font-family:inherit;font-size:16px;color:var(--text);width:100%;background:var(--card);border:1px solid var(--line2);border-radius:12px;padding:13px 15px;outline:none;transition:border-color .3s var(--ease),box-shadow .3s var(--ease),background .3s var(--ease)}
+input:focus,textarea:focus,select:focus{border-color:var(--brand);box-shadow:0 0 0 4px rgba(99,102,241,.16)}
+input::placeholder,textarea::placeholder{color:var(--muted)}
+textarea{resize:vertical}
 a{color:var(--brand);text-decoration:none}
+:focus-visible{outline:2px solid var(--brand);outline-offset:2px;border-radius:6px}
+::selection{background:rgba(99,102,241,.25)}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-thumb{background:rgba(99,102,241,.3);border-radius:50px;border:2.5px solid transparent;background-clip:content-box}
+::-webkit-scrollbar-thumb:hover{background:rgba(99,102,241,.5);border:2.5px solid transparent;background-clip:content-box}
+::-webkit-scrollbar-track{background:transparent}
+
 @keyframes fadeInUp{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
-@keyframes slideInRight{from{opacity:0;transform:translateX(24px)}to{opacity:1;transform:none}}
-@keyframes popIn{0%{opacity:0;transform:scale(.9)}100%{opacity:1;transform:scale(1)}}
-@keyframes blob{0%,100%{transform:translate(0,0) scale(1)}33%{transform:translate(30px,-50px) scale(1.1)}66%{transform:translate(-20px,20px) scale(.9)}}
+@keyframes slideInRight{from{opacity:0;transform:translateX(26px)}to{opacity:1;transform:none}}
+@keyframes popIn{0%{opacity:0;transform:scale(.86)}100%{opacity:1;transform:scale(1)}}
+@keyframes screenIn{from{opacity:0;transform:translateY(18px) scale(.998)}to{opacity:1;transform:none}}
+@keyframes modalIn{0%{opacity:0;transform:scale(.92) translateY(14px)}100%{opacity:1;transform:none}}
+@keyframes blob{0%,100%{transform:translate(0,0) scale(1)}33%{transform:translate(30px,-50px) scale(1.12)}66%{transform:translate(-22px,22px) scale(.92)}}
 @keyframes shimmer{0%{background-position:-468px 0}100%{background-position:468px 0}}
-.bg-blob{position:fixed;border-radius:50%;filter:blur(90px);z-index:0;opacity:.35;pointer-events:none}
-.blob-1{width:320px;height:320px;background:var(--brand);top:-60px;left:-60px;animation:blob 12s infinite ease-in-out}
-.blob-2{width:280px;height:280px;background:var(--accent);bottom:-60px;right:-60px;animation:blob 15s infinite ease-in-out reverse}
-.navbar{position:sticky;top:0;z-index:50;background:var(--card);border-bottom:1px solid var(--line);height:58px;display:flex;align-items:center;box-shadow:var(--shadow)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+@keyframes spin{0%{transform:rotate(0)}100%{transform:rotate(360deg)}}
+@keyframes shake{0%,100%{transform:translateX(0)}18%{transform:translateX(-9px)}36%{transform:translateX(8px)}54%{transform:translateX(-5px)}72%{transform:translateX(3px)}}
+@keyframes lockPulse{0%,100%{box-shadow:0 0 0 0 rgba(99,102,241,.3)}50%{box-shadow:0 0 0 14px rgba(99,102,241,0)}}
+@keyframes drawCheck{to{stroke-dashoffset:0}}
+@keyframes badgePop{0%{transform:scale(.7);opacity:0}60%{transform:scale(1.08)}100%{transform:scale(1);opacity:1}}
+
+.bg-blob{position:fixed;border-radius:50%;filter:blur(90px);z-index:0;opacity:.4;pointer-events:none}
+.blob-1{width:340px;height:340px;background:#6366f1;top:-80px;left:-80px;animation:blob 13s infinite ease-in-out}
+.blob-2{width:300px;height:300px;background:#f59e0b;bottom:-80px;right:-80px;animation:blob 16s infinite ease-in-out reverse}
+
+.navbar{position:sticky;top:0;z-index:50;background:color-mix(in srgb,var(--card) 78%,transparent);backdrop-filter:blur(20px) saturate(1.7);-webkit-backdrop-filter:blur(20px) saturate(1.7);border-bottom:1px solid var(--line);height:58px;display:flex;align-items:center;transition:background .4s var(--ease)}
 .nav-wrap{display:flex;align-items:center;justify-content:space-between}
-.brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:1.15rem}
-.brand-dot{width:28px;height:28px;border-radius:9px;background:linear-gradient(135deg,#6366f1,#8b5cf6,#d946ef);position:relative;box-shadow:0 4px 10px rgba(99,102,241,.35)}
+.brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:1.15rem;letter-spacing:-.02em}
+.brand-dot{width:28px;height:28px;border-radius:9px;background:var(--grad-brand);position:relative;box-shadow:0 6px 16px -4px rgba(99,102,241,.55);transition:transform .35s var(--pop)}
+.brand:hover .brand-dot{transform:rotate(-8deg) scale(1.06)}
 .brand-dot::after{content:"M";position:absolute;inset:0;display:grid;place-items:center;color:#fff;font-weight:800;font-size:14px}
 .nav-right{display:flex;align-items:center;gap:10px}
-.user-chip{display:flex;align-items:center;gap:6px;padding:5px 12px;border-radius:50px;background:var(--sunk);font-size:.85rem;font-weight:600;cursor:pointer}
-.dot-live{width:8px;height:8px;border-radius:50%;background:var(--ok);animation:pulse 2s infinite}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-.icon-btn{width:40px;height:40px;border-radius:12px;display:flex;align-items:center;justify-content:center;background:var(--sunk);border:1px solid var(--line)}
-.icon-btn:hover{background:var(--brand);color:#fff;border-color:var(--brand)}
+.user-chip{display:flex;align-items:center;gap:6px;padding:5px 12px;border-radius:50px;background:var(--sunk);border:1px solid var(--line);font-size:.85rem;font-weight:600;cursor:pointer;transition:border-color .3s var(--ease),transform .3s var(--ease)}
+.user-chip:hover{border-color:var(--brand);transform:translateY(-1px)}
+.dot-live{width:8px;height:8px;border-radius:50%;background:var(--ok);animation:pulse 2s infinite;box-shadow:0 0 0 3px var(--oksoft)}
+.icon-btn{width:40px;height:40px;border-radius:12px;display:flex;align-items:center;justify-content:center;background:var(--sunk);border:1px solid var(--line);transition:background .3s var(--ease),border-color .3s var(--ease),transform .3s var(--ease),box-shadow .3s var(--ease)}
+.icon-btn:hover{background:var(--grad-brand);color:#fff;border-color:transparent;box-shadow:var(--shadowGlow);transform:translateY(-1px)}
 [data-theme="light"] .i-moon,[data-theme="dark"] .i-sun{display:none}
-.bottom-nav{display:flex;position:fixed;bottom:0;left:0;right:0;background:var(--card);border-top:1px solid var(--line);z-index:45;padding:6px 0 calc(6px + env(safe-area-inset-bottom));justify-content:space-around;align-items:center;box-shadow:0 -6px 16px rgba(0,0,0,.05)}
-.bottom-nav button{display:flex;flex-direction:column;align-items:center;gap:2px;color:var(--muted);font-size:.62rem;padding:4px 0;font-weight:700}
+.bottom-nav{display:flex;position:fixed;bottom:0;left:0;right:0;background:color-mix(in srgb,var(--card) 82%,transparent);backdrop-filter:blur(20px) saturate(1.7);-webkit-backdrop-filter:blur(20px) saturate(1.7);border-top:1px solid var(--line);z-index:45;padding:6px 0 calc(6px + env(safe-area-inset-bottom));justify-content:space-around;align-items:center}
+.bottom-nav button{display:flex;flex-direction:column;align-items:center;gap:2px;color:var(--muted);font-size:.62rem;padding:4px 0;font-weight:700;transition:color .3s var(--ease),transform .3s var(--ease)}
+.bottom-nav button:hover{transform:translateY(-2px)}
 .bottom-nav button.active{color:var(--brand)}
-.bottom-nav button svg{width:22px;height:22px}
-.screen{display:none;padding:24px 0 90px;animation:fadeInUp .35s ease}
-.screen.active{display:block}
+.bottom-nav button svg{width:22px;height:22px;transition:transform .35s var(--pop)}
+.bottom-nav button.active svg{transform:translateY(-1px) scale(1.08)}
+
+.screen{display:none;padding:24px 0 90px}
+.screen.active{display:block;animation:screenIn .5s var(--ease)}
+
 .hero{max-width:620px;margin:0 auto;text-align:center;padding:40px 16px}
-.hero-tag{display:inline-flex;align-items:center;gap:8px;padding:6px 16px;border-radius:100px;background:var(--sunk);border:1px solid var(--line);font-size:.85rem;font-weight:600;color:var(--text2);margin-bottom:20px}
-.hero-title{font-size:clamp(2rem,7vw,3.2rem);font-weight:800;line-height:1.1;margin-bottom:12px}
+.hero-tag{display:inline-flex;align-items:center;gap:8px;padding:6px 16px;border-radius:100px;background:var(--card);backdrop-filter:blur(14px);border:1px solid var(--line);font-size:.85rem;font-weight:600;color:var(--text2);margin-bottom:20px;box-shadow:var(--shadow)}
+.hero-title{font-size:clamp(2rem,7vw,3.2rem);font-weight:800;line-height:1.08;margin-bottom:12px;letter-spacing:-.03em}
 .grad-word{background:linear-gradient(100deg,var(--brand),var(--brand2),var(--accent));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
 .hero-sub{max-width:500px;margin:0 auto 24px;color:var(--text2);font-size:1rem}
-.name-card{background:var(--card);border:1px solid var(--line);border-radius:20px;padding:24px;box-shadow:var(--shadowMd);text-align:left;margin-bottom:20px}
-.name-card label{display:block;font-weight:700;margin-bottom:8px;color:var(--text2);text-transform:uppercase;font-size:.72rem;letter-spacing:.1em}
+.name-card{background:var(--card);backdrop-filter:blur(20px) saturate(1.6);-webkit-backdrop-filter:blur(20px) saturate(1.6);border:1px solid var(--line);border-radius:22px;padding:24px;box-shadow:var(--shadowLg);text-align:left;margin-bottom:20px;transition:box-shadow .4s var(--ease),transform .4s var(--ease)}
+.name-card:hover{box-shadow:var(--shadowLg),0 0 0 1px rgba(99,102,241,.12);transform:translateY(-2px)}
+.name-card label{display:block;font-weight:700;margin-bottom:8px;color:var(--text2);text-transform:uppercase;font-size:.72rem;letter-spacing:.12em}
 .name-row{display:flex;gap:10px;flex-wrap:wrap}
-input,textarea,select{padding:13px 15px;border:1px solid var(--line2);border-radius:12px;background:var(--bg);font-size:1rem;outline:none;transition:border-color .2s,box-shadow .2s}
-input:focus,textarea:focus,select:focus{border-color:var(--brand);box-shadow:0 0 0 3px rgba(79,70,229,.18)}
 .name-hint{font-size:.74rem;color:var(--muted);margin-top:8px}
-.btn-primary{display:inline-flex;align-items:center;gap:8px;padding:13px 22px;border-radius:12px;background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff;font-weight:700;font-size:.98rem;box-shadow:0 4px 14px rgba(79,70,229,.3)}
-.btn-primary:hover{transform:translateY(-2px);box-shadow:0 8px 22px rgba(79,70,229,.4)}
-.btn-ghost{display:inline-flex;align-items:center;gap:6px;padding:11px 18px;border-radius:12px;background:var(--card);color:var(--text);font-weight:600;font-size:.92rem;border:1px solid var(--line)}
-.btn-ghost:hover{background:var(--sunk);border-color:var(--line2)}
-.btn-danger{padding:11px 16px;border-radius:12px;background:var(--errsoft);color:var(--err);font-weight:700;border:1px solid transparent}
-.btn-danger:hover{background:var(--err);color:#fff}
+
+.btn-primary{position:relative;overflow:hidden;display:inline-flex;align-items:center;gap:8px;justify-content:center;padding:13px 22px;border-radius:14px;background:var(--grad-brand);color:#fff;font-weight:700;font-size:.98rem;box-shadow:0 8px 20px -6px rgba(99,102,241,.5),0 2px 6px rgba(99,102,241,.25);transition:transform .35s var(--ease),box-shadow .35s var(--ease),filter .3s var(--ease),opacity .3s var(--ease)}
+.btn-primary::after{content:"";position:absolute;top:0;left:-80%;width:50%;height:100%;background:linear-gradient(100deg,transparent,rgba(255,255,255,.35),transparent);transform:skewX(-20deg);transition:left .65s var(--ease);pointer-events:none}
+.btn-primary:hover{transform:translateY(-2px);box-shadow:0 14px 30px -8px rgba(99,102,241,.6),0 4px 10px rgba(99,102,241,.3)}
+.btn-primary:hover::after{left:130%}
+.btn-primary:active{transform:translateY(0) scale(.97)}
+.btn-primary:disabled{opacity:.55;cursor:not-allowed;transform:none;box-shadow:0 4px 12px -4px rgba(99,102,241,.3)}
+.btn-primary:disabled::after{display:none}
+.btn-ghost{display:inline-flex;align-items:center;gap:6px;justify-content:center;padding:11px 18px;border-radius:12px;background:var(--card);color:var(--text);font-weight:600;font-size:.92rem;border:1px solid var(--line);backdrop-filter:blur(10px);transition:background .3s var(--ease),border-color .3s var(--ease),transform .3s var(--ease),box-shadow .3s var(--ease)}
+.btn-ghost:hover{background:var(--sunk);border-color:var(--line2);transform:translateY(-1px)}
+.btn-ghost:active{transform:scale(.97)}
+.btn-ghost:disabled{opacity:.55;cursor:not-allowed}
+.btn-danger{padding:11px 16px;border-radius:12px;background:var(--errsoft);color:var(--err);font-weight:700;border:1px solid transparent;transition:background .3s var(--ease),color .3s var(--ease),transform .3s var(--ease)}
+.btn-danger:hover{background:var(--grad-red);color:#fff;transform:translateY(-1px)}
+.btn-spinner{width:16px;height:16px;border:2px solid rgba(255,255,255,.4);border-top-color:#fff;border-radius:50%;display:inline-block;animation:spin .8s linear infinite;vertical-align:-3px}
+.btn-ghost .btn-spinner{border-color:rgba(99,102,241,.3);border-top-color:var(--brand)}
+
 .hidden{display:none!important}
 .page-head{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:22px}
-.eyebrow{text-transform:uppercase;letter-spacing:.1em;font-size:.68rem;color:var(--muted);font-weight:700}
-.page-title{font-size:1.9rem;font-weight:800}
-.profile-card{background:linear-gradient(135deg,var(--brand),#7c3aed 60%,#9333ea);border-radius:24px;padding:24px;color:#fff;display:flex;justify-content:space-between;align-items:center;box-shadow:0 14px 34px rgba(79,70,229,.35);position:relative;overflow:hidden;margin-bottom:20px}
-.profile-card::before{content:"";position:absolute;inset:0;background-image:radial-gradient(circle at 1px 1px,rgba(255,255,255,.25) 1px,transparent 0);background-size:22px 22px;opacity:.5}
-.pc-left h2{font-size:1.5rem;font-weight:800;margin-bottom:4px}
+.eyebrow{text-transform:uppercase;letter-spacing:.14em;font-size:.68rem;color:var(--muted);font-weight:700}
+.page-title{font-size:1.9rem;font-weight:800;letter-spacing:-.02em}
+
+.profile-card{background:linear-gradient(135deg,#4f46e5,#7c3aed 60%,#9333ea);border-radius:26px;padding:24px;color:#fff;display:flex;justify-content:space-between;align-items:center;box-shadow:0 18px 44px -12px rgba(79,70,229,.55),0 4px 12px rgba(79,70,229,.25);position:relative;overflow:hidden;margin-bottom:20px;transition:transform .4s var(--ease),box-shadow .4s var(--ease)}
+.profile-card:hover{transform:translateY(-2px);box-shadow:0 24px 56px -14px rgba(79,70,229,.6),0 4px 12px rgba(79,70,229,.25)}
+.profile-card::before{content:"";position:absolute;inset:0;background-image:radial-gradient(circle at 1px 1px,rgba(255,255,255,.28) 1px,transparent 0);background-size:22px 22px;opacity:.5}
+.profile-card::after{content:"";position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(255,255,255,.6),transparent)}
+.pc-left{position:relative;z-index:1}
+.pc-left h2{font-size:1.5rem;font-weight:800;margin-bottom:4px;letter-spacing:-.02em}
 .pc-left p{font-size:.82rem;color:rgba(255,255,255,.85)}
-.pc-right{text-align:center}
-.level-badge{width:64px;height:64px;border-radius:50%;background:rgba(255,255,255,.18);border:2px solid rgba(255,255,255,.5);backdrop-filter:blur(4px);display:grid;place-items:center;font-weight:800;font-size:1.5rem}
-.pc-right span{font-size:.62rem;color:rgba(255,255,255,.85);text-transform:uppercase;letter-spacing:.05em}
-.chip{display:inline-flex;align-items:center;gap:6px;border-radius:50px;padding:4px 12px;background:rgba(255,255,255,.16);backdrop-filter:blur(4px);font-size:.76rem;font-weight:700;color:#fff}
+.pc-right{text-align:center;position:relative;z-index:1}
+.level-badge{width:64px;height:64px;border-radius:50%;background:rgba(255,255,255,.16);border:2px solid rgba(255,255,255,.5);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);display:grid;place-items:center;font-weight:800;font-size:1.5rem;box-shadow:inset 0 1px 0 rgba(255,255,255,.4);transition:transform .4s var(--pop)}
+.pc-right:hover .level-badge{transform:scale(1.06)}
+.pc-right span{font-size:.62rem;color:rgba(255,255,255,.85);text-transform:uppercase;letter-spacing:.08em}
+.chip{display:inline-flex;align-items:center;gap:6px;border-radius:50px;padding:4px 12px;background:rgba(255,255,255,.16);backdrop-filter:blur(6px);border:1px solid rgba(255,255,255,.22);font-size:.76rem;font-weight:700;color:#fff}
+
 .quick-stats{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-bottom:20px}
 @media(min-width:600px){.quick-stats{grid-template-columns:repeat(4,1fr)}}
-.stat{padding:14px;background:var(--card);border:1px solid var(--line);border-radius:16px;text-align:center;box-shadow:var(--shadow)}
-.stat b{display:block;font-size:1.5rem;font-weight:800;background:linear-gradient(135deg,var(--brand),var(--brand2));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
-.stat span{font-size:.66rem;color:var(--muted);text-transform:uppercase;font-weight:700}
+.stat{padding:14px;background:var(--card);backdrop-filter:blur(16px);border:1px solid var(--line);border-radius:18px;text-align:center;box-shadow:var(--shadowMd);transition:transform .35s var(--ease),box-shadow .35s var(--ease),border-color .35s var(--ease)}
+.stat:hover{transform:translateY(-3px);box-shadow:var(--shadowLg);border-color:rgba(99,102,241,.25)}
+.stat b{display:block;font-size:1.5rem;font-weight:800;background:var(--grad-brand);-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
+.stat span{font-size:.66rem;color:var(--muted);text-transform:uppercase;font-weight:700;letter-spacing:.06em}
+
 .grid-2{display:grid;grid-template-columns:repeat(2,1fr);gap:12px;margin:20px 0}
 @media(min-width:600px){.grid-2{grid-template-columns:repeat(3,1fr)}}
-.action-card{padding:18px;border-radius:22px;background:var(--card);border:1px solid var(--line);cursor:pointer;position:relative;overflow:hidden;text-align:left;width:100%;box-shadow:var(--shadow)}
-.action-card:hover{transform:translateY(-3px);box-shadow:var(--shadowLg);border-color:var(--brand)}
-.ac-icon{width:42px;height:42px;border-radius:13px;display:grid;place-items:center;margin-bottom:10px;color:#fff;font-size:1.15rem}
-.g1{background:linear-gradient(135deg,#6366f1,#8b5cf6)}.g2{background:linear-gradient(135deg,#f59e0b,#f97316)}
-.g3{background:linear-gradient(135deg,#10b981,#06b6d4)}.g4{background:linear-gradient(135deg,#ef4444,#f97316)}
-.g5{background:linear-gradient(135deg,#8b5cf6,#ec4899)}.g6{background:linear-gradient(135deg,#06b6d4,#3b82f6)}
+.action-card{padding:18px;border-radius:22px;background:var(--card);backdrop-filter:blur(16px) saturate(1.5);border:1px solid var(--line);cursor:pointer;position:relative;overflow:hidden;text-align:left;width:100%;box-shadow:var(--shadowMd);transition:transform .4s var(--ease),box-shadow .4s var(--ease),border-color .4s var(--ease)}
+.action-card::after{content:"";position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(255,255,255,.55),transparent);opacity:.7}
+.action-card:hover{transform:translateY(-4px);box-shadow:var(--shadowLg);border-color:rgba(99,102,241,.35)}
+.action-card:active{transform:translateY(-1px) scale(.985)}
+.ac-icon{width:42px;height:42px;border-radius:13px;display:grid;place-items:center;margin-bottom:10px;color:#fff;font-size:1.15rem;box-shadow:0 6px 14px -4px rgba(23,27,60,.3);transition:transform .4s var(--pop)}
+.action-card:hover .ac-icon{transform:scale(1.08) rotate(-4deg)}
+.g1{background:var(--grad-brand)}.g2{background:var(--grad-amber)}.g3{background:var(--grad-mint)}
+.g4{background:var(--grad-red)}.g5{background:var(--grad-pink)}.g6{background:var(--grad-blue)}
 .action-card h3{font-size:.98rem;margin-bottom:4px;font-weight:800}
 .action-card p{color:var(--text2);font-size:.78rem;margin:0}
-.ac-arrow{position:absolute;right:14px;top:14px;font-size:1.15rem;color:var(--muted);transition:.3s}
+.ac-arrow{position:absolute;right:14px;top:14px;font-size:1.15rem;color:var(--muted);transition:transform .35s var(--ease),color .35s var(--ease)}
 .action-card:hover .ac-arrow{transform:translateX(6px);color:var(--brand)}
-.section-h{font-weight:800;font-size:.8rem;color:var(--text2);letter-spacing:.05em;text-transform:uppercase;margin:24px 0 10px}
+
+.section-h{font-weight:800;font-size:.8rem;color:var(--text2);letter-spacing:.08em;text-transform:uppercase;margin:24px 0 10px}
 .subtopic-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px}
-.subtopic-tile{padding:15px;border-radius:16px;background:var(--card);border:1px solid var(--line);cursor:pointer;text-align:left;width:100%;box-shadow:var(--shadow)}
-.subtopic-tile:hover{transform:translateY(-2px);border-color:var(--brand);box-shadow:var(--shadowMd)}
-.subtopic-tile h4{font-size:.9rem;margin-bottom:4px;font-weight:800}
+.subtopic-tile{padding:15px;border-radius:18px;background:var(--card);backdrop-filter:blur(16px);border:1px solid var(--line);cursor:pointer;text-align:left;width:100%;box-shadow:var(--shadow);transition:transform .4s var(--ease),border-color .4s var(--ease),box-shadow .4s var(--ease)}
+.subtopic-tile:hover{transform:translateY(-3px);border-color:rgba(99,102,241,.4);box-shadow:var(--shadowLg)}
+.subtopic-tile:active{transform:scale(.98)}
+.subtopic-tile h4{font-size:.9rem;margin-bottom:4px;font-weight:800;letter-spacing:-.01em}
 .subtopic-tile span{font-size:.7rem;color:var(--muted)}
-.empty{padding:22px;text-align:center;color:var(--muted);border:1.5px dashed var(--line2);border-radius:14px;background:var(--sunk)}
+.empty{padding:22px;text-align:center;color:var(--muted);border:1.5px dashed var(--line2);border-radius:16px;background:var(--sunk)}
+
 .recent-list{display:grid;gap:10px}
-.recent-item{display:flex;justify-content:space-between;align-items:center;padding:13px 15px;background:var(--card);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow)}
+.recent-item{display:flex;justify-content:space-between;align-items:center;padding:13px 15px;background:var(--card);backdrop-filter:blur(16px);border:1px solid var(--line);border-radius:18px;box-shadow:var(--shadow);transition:transform .35s var(--ease),box-shadow .35s var(--ease)}
+.recent-item:hover{transform:translateY(-2px);box-shadow:var(--shadowMd)}
 .ri-left{display:flex;align-items:center;gap:12px}
-.ri-badge{width:46px;height:46px;border-radius:13px;display:grid;place-items:center;font-weight:800;font-size:.95rem;color:#fff;flex-shrink:0}
-.ri-badge.ok{background:linear-gradient(135deg,#10b981,#06b6d4)}.ri-badge.avg{background:linear-gradient(135deg,#f59e0b,#f97316)}.ri-badge.bad{background:linear-gradient(135deg,#ef4444,#f97316)}
+.ri-badge{width:46px;height:46px;border-radius:14px;display:grid;place-items:center;font-weight:800;font-size:.95rem;color:#fff;flex-shrink:0;box-shadow:0 6px 14px -4px rgba(23,27,60,.3)}
+.ri-badge.ok{background:var(--grad-mint)}.ri-badge.avg{background:var(--grad-amber)}.ri-badge.bad{background:var(--grad-red)}
 .recent-item h5{font-size:.88rem;margin:0}.recent-item small{color:var(--muted);font-size:.72rem}
-.skeleton-card{background:var(--sunk);border-radius:16px;height:80px;width:100%;background-image:linear-gradient(90deg,var(--sunk) 0px,var(--card) 40px,var(--sunk) 80px);background-size:600px;animation:shimmer 1.4s infinite linear}
-.test-topbar{background:var(--card);border-bottom:1px solid var(--line);padding:10px 0;position:sticky;top:0;z-index:30}
+.skeleton-card{background:var(--sunk);border-radius:16px;height:80px;width:100%;background-image:linear-gradient(90deg,var(--sunk) 0px,color-mix(in srgb,var(--card) 60%,transparent) 40px,var(--sunk) 80px);background-size:600px;animation:shimmer 1.4s infinite linear;border:1px solid var(--line)}
+
+.test-topbar{background:color-mix(in srgb,var(--card) 82%,transparent);backdrop-filter:blur(20px) saturate(1.7);-webkit-backdrop-filter:blur(20px) saturate(1.7);border-bottom:1px solid var(--line);padding:10px 0;position:sticky;top:0;z-index:30}
 .test-topwrap{display:flex;align-items:center;gap:10px}
 .tp-progress{flex:1;display:flex;align-items:center;gap:8px;font-weight:700;font-size:.9rem;min-width:0}
 .tp-bar{flex:1;max-width:150px;height:6px;background:var(--sunk);border-radius:50px;overflow:hidden}
-.tp-bar span{display:block;height:100%;background:linear-gradient(90deg,var(--brand),var(--brand2));border-radius:50px;transition:width .4s}
-.tp-timer{padding:7px 12px;border-radius:10px;font-family:var(--mono);font-weight:700;background:var(--sunk);font-size:.9rem;border:1px solid var(--line)}
+.tp-bar span{display:block;height:100%;background:var(--grad-brand);border-radius:50px;transition:width .5s var(--ease)}
+.tp-timer{padding:7px 12px;border-radius:10px;font-family:var(--mono);font-weight:700;background:var(--sunk);font-size:.9rem;border:1px solid var(--line);transition:color .3s var(--ease),border-color .3s var(--ease),transform .3s var(--ease)}
 .tp-timer.warn{color:var(--err);border-color:var(--err);animation:pulse 1s infinite}
 .test-body{padding-top:20px}
-.question-card{background:var(--card);border:1px solid var(--line);border-radius:24px;padding:24px;box-shadow:var(--shadowMd)}
-.q-card-animate{animation:slideInRight .28s ease-out}
-.q-cat-top{display:inline-block;padding:4px 12px;border-radius:20px;font-size:.72rem;font-weight:800;background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff;margin-bottom:12px}
-.q-text-lg{font-size:clamp(1.05rem,2.5vw,1.35rem);font-weight:800;margin:0 0 18px;line-height:1.4}
+.question-card{background:var(--card);backdrop-filter:blur(20px) saturate(1.6);border:1px solid var(--line);border-radius:26px;padding:24px;box-shadow:var(--shadowLg)}
+.q-card-animate{animation:slideInRight .32s var(--ease)}
+.q-cat-top{display:inline-block;padding:4px 12px;border-radius:20px;font-size:.72rem;font-weight:800;background:var(--grad-brand);color:#fff;margin-bottom:12px;box-shadow:0 4px 10px -3px rgba(99,102,241,.4)}
+.q-text-lg{font-size:clamp(1.05rem,2.5vw,1.35rem);font-weight:800;margin:0 0 18px;line-height:1.4;letter-spacing:-.01em}
 .opt-list{display:grid;gap:9px}
-.opt{display:flex;align-items:center;gap:12px;padding:13px 15px;border:2px solid var(--line2);border-radius:14px;background:var(--bg);font-weight:600;font-size:.95rem;text-align:left;width:100%}
-.opt:hover:not(:disabled){border-color:var(--brand);transform:translateX(2px)}
+.opt{display:flex;align-items:center;gap:12px;padding:13px 15px;border:2px solid var(--line2);border-radius:14px;background:var(--card);font-weight:600;font-size:.95rem;text-align:left;width:100%;transition:border-color .3s var(--ease),transform .3s var(--ease),background .3s var(--ease),box-shadow .3s var(--ease)}
+.opt:hover:not(:disabled){border-color:var(--brand);transform:translateX(3px);box-shadow:var(--shadowMd)}
 .opt:disabled{opacity:.95;cursor:default}
-.opt .kbd{width:30px;height:30px;border-radius:9px;display:flex;align-items:center;justify-content:center;background:var(--sunk);border:1px solid var(--line);font-weight:800;font-size:13px;color:var(--text2);flex-shrink:0}
-.opt.correct{border-color:var(--ok);background:var(--oksoft)}.opt.correct .kbd{background:var(--ok);color:#fff;border-color:var(--ok)}
-.opt.wrong{border-color:var(--err);background:var(--errsoft)}.opt.wrong .kbd{background:var(--err);color:#fff;border-color:var(--err)}
-.explanation{margin-top:14px;padding:13px;background:rgba(245,158,11,.08);border-left:4px solid var(--accent);border-radius:10px;color:var(--text2);font-size:.9rem;animation:fadeInUp .3s ease}
+.opt .kbd{width:30px;height:30px;border-radius:9px;display:flex;align-items:center;justify-content:center;background:var(--sunk);border:1px solid var(--line);font-weight:800;font-size:13px;color:var(--text2);flex-shrink:0;transition:background .3s var(--ease),color .3s var(--ease)}
+.opt.correct{border-color:rgba(16,185,129,.5);background:var(--oksoft)}.opt.correct .kbd{background:var(--ok);color:#fff;border-color:var(--ok)}
+.opt.wrong{border-color:rgba(239,68,68,.5);background:var(--errsoft)}.opt.wrong .kbd{background:var(--err);color:#fff;border-color:var(--err)}
+.explanation{margin-top:14px;padding:13px;background:var(--warnsoft);border-left:4px solid var(--accent);border-radius:10px;color:var(--text2);font-size:.9rem;animation:fadeInUp .35s var(--ease)}
 .test-actions{display:flex;justify-content:space-between;gap:8px;margin-top:16px}
 .palette{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:16px}
-.palette button{width:30px;height:30px;border-radius:9px;font-size:.7rem;font-weight:800;border:1px solid var(--line);background:var(--card);color:var(--muted)}
-.palette button.cur{background:var(--brand);color:#fff;border-color:var(--brand)}
-.palette button.done{background:var(--ok);color:#fff;border-color:var(--ok)}
-.xp-popup{position:fixed;top:22%;left:50%;transform:translate(-50%,-50%);background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff;padding:18px 30px;border-radius:16px;font-weight:800;font-size:1.4rem;box-shadow:0 12px 34px rgba(0,0,0,.25);z-index:200;animation:popIn .4s ease, fadeOut 1s ease 1.4s forwards;opacity:0}
+.palette button{width:30px;height:30px;border-radius:9px;font-size:.7rem;font-weight:800;border:1px solid var(--line);background:var(--card);color:var(--muted);transition:transform .25s var(--ease),background .3s var(--ease),color .3s var(--ease),border-color .3s var(--ease)}
+.palette button:hover{transform:translateY(-2px)}
+.palette button.cur{background:var(--grad-brand);color:#fff;border-color:transparent;box-shadow:0 4px 12px -3px rgba(99,102,241,.5);transform:scale(1.1)}
+.palette button.done{background:var(--grad-mint);color:#fff;border-color:transparent}
+.xp-popup{position:fixed;top:22%;left:50%;transform:translate(-50%,-50%);background:var(--grad-brand);color:#fff;padding:18px 30px;border-radius:16px;font-weight:800;font-size:1.4rem;box-shadow:var(--shadowGlow),var(--shadowLg);z-index:200;animation:popIn .45s var(--pop),fadeOut .6s var(--ease) 1.4s forwards;opacity:0}
 @keyframes fadeOut{to{opacity:0;visibility:hidden}}
-.result-hero{max-width:560px;margin:auto;text-align:center;padding:28px 16px;background:var(--card);border:1px solid var(--line);border-radius:24px;box-shadow:var(--shadowLg)}
-.result-emoji{font-size:3.4rem;animation:popIn .7s}
-.result-hero h2{font-size:1.7rem;font-weight:800;margin-bottom:6px}
+
+.result-hero{max-width:560px;margin:auto;text-align:center;padding:28px 16px;background:var(--card);backdrop-filter:blur(20px) saturate(1.6);border:1px solid var(--line);border-radius:26px;box-shadow:var(--shadowLg)}
+.result-emoji{font-size:3.4rem;animation:popIn .7s var(--pop)}
+.result-hero h2{font-size:1.7rem;font-weight:800;margin-bottom:6px;letter-spacing:-.02em}
 .ring-wrap{position:relative;width:160px;height:160px;margin:20px auto}
 .ring{width:100%;height:100%;transform:rotate(-90deg)}
-.ring-bg{fill:none;stroke:var(--sunk);stroke-width:10}.ring-fg{fill:none;stroke:url(#gradRing);stroke-width:10;stroke-linecap:round;stroke-dasharray:267;stroke-dashoffset:267;transition:stroke-dashoffset 1.1s}
+.ring-bg{fill:none;stroke:var(--sunk);stroke-width:10}.ring-fg{fill:none;stroke:url(#gradRing);stroke-width:10;stroke-linecap:round;stroke-dasharray:267;stroke-dashoffset:267;transition:stroke-dashoffset 1.2s var(--ease);filter:drop-shadow(0 4px 10px rgba(99,102,241,.4))}
 .ring-center{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:center;align-items:center}
-.ring-center b{font-size:2rem;font-weight:800}.ring-center span{font-size:.66rem;color:var(--muted);text-transform:uppercase}
+.ring-center b{font-size:2rem;font-weight:800}.ring-center span{font-size:.66rem;color:var(--muted);text-transform:uppercase;letter-spacing:.08em}
 .result-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:20px 0}
 @media(max-width:420px){.result-grid{grid-template-columns:repeat(2,1fr)}}
-.result-grid>div{padding:12px;background:var(--sunk);border:1px solid var(--line);border-radius:14px;animation:fadeInUp .5s ease backwards}
-.result-grid>div:nth-child(2){animation-delay:.1s}.result-grid>div:nth-child(3){animation-delay:.2s}.result-grid>div:nth-child(4){animation-delay:.3s}
-.result-grid b{display:block;font-size:1.35rem}.result-grid span{font-size:.64rem;color:var(--muted);text-transform:uppercase;font-weight:700}
+.result-grid>div{padding:12px;background:var(--sunk);border:1px solid var(--line);border-radius:16px;animation:fadeInUp .5s var(--ease) backwards;transition:transform .3s var(--ease)}
+.result-grid>div:hover{transform:translateY(-2px)}
+.result-grid>div:nth-child(2){animation-delay:.08s}.result-grid>div:nth-child(3){animation-delay:.16s}.result-grid>div:nth-child(4){animation-delay:.24s}
+.result-grid b{display:block;font-size:1.35rem}.result-grid span{font-size:.64rem;color:var(--muted);text-transform:uppercase;font-weight:700;letter-spacing:.06em}
 .result-actions{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;margin-top:20px}
-.xp-banner{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:16px;padding:14px 18px;border-radius:16px;background:linear-gradient(135deg,var(--brand),var(--brand2));color:#fff;text-align:left}
+.xp-banner{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:16px;padding:14px 18px;border-radius:16px;background:var(--grad-brand);color:#fff;text-align:left;animation:fadeInUp .4s var(--ease)}
 .review-list{margin-top:20px;display:grid;gap:10px}
-.review-card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:15px;text-align:left;animation:fadeInUp .4s ease}
+.review-card{background:var(--card);backdrop-filter:blur(16px);border:1px solid var(--line);border-radius:20px;padding:15px;text-align:left;animation:fadeInUp .4s var(--ease);transition:box-shadow .35s var(--ease)}
+.review-card:hover{box-shadow:var(--shadowMd)}
 .rc-status{padding:2px 10px;border-radius:20px;font-size:.64rem;font-weight:800;text-transform:uppercase}
 .rc-status.ok{background:var(--oksoft);color:var(--ok)}.rc-status.no{background:var(--errsoft);color:var(--err)}.rc-status.sk{background:var(--sunk);color:var(--muted)}
 .review-card .rc-q{font-weight:800;margin:8px 0;font-size:.9rem;line-height:1.45}
@@ -922,57 +1064,101 @@ input:focus,textarea:focus,select:focus{border-color:var(--brand);box-shadow:0 0
 .rc-opt{padding:7px 9px;border-radius:10px;background:var(--sunk);border:1px solid var(--line);font-size:.8rem;display:flex;align-items:center;gap:7px}
 .rc-opt.correct{background:var(--oksoft);border-color:transparent;color:var(--ok);font-weight:700}
 .rc-opt.wrong{background:var(--errsoft);border-color:transparent;color:var(--err);font-weight:700;text-decoration:line-through}
-.rc-explain{margin-top:8px;padding:9px;background:rgba(245,158,11,.08);border-left:4px solid var(--accent);border-radius:8px;font-size:.8rem;color:var(--text2)}
-.weak-q-item{background:var(--card);border:1px solid var(--line);border-left:5px solid var(--warn);border-radius:18px;padding:15px;margin-bottom:10px;animation:fadeInUp .4s ease}
+.rc-explain{margin-top:8px;padding:9px;background:var(--warnsoft);border-left:4px solid var(--accent);border-radius:8px;font-size:.8rem;color:var(--text2)}
+.weak-q-item{background:var(--card);backdrop-filter:blur(16px);border:1px solid var(--line);border-left:5px solid var(--warn);border-radius:20px;padding:15px;margin-bottom:10px;animation:fadeInUp .4s var(--ease);transition:box-shadow .35s var(--ease),transform .35s var(--ease)}
+.weak-q-item:hover{box-shadow:var(--shadowMd);transform:translateY(-2px)}
 .weak-q-item .wq-head{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;margin-bottom:8px}
 .weak-q-item .wq-q{font-weight:800;font-size:.95rem;line-height:1.45;flex:1}
-.weak-count{background:var(--accent);color:#fff;padding:4px 11px;border-radius:20px;font-weight:800;font-size:.7rem;white-space:nowrap}
+.weak-count{background:var(--grad-amber);color:#fff;padding:4px 11px;border-radius:20px;font-weight:800;font-size:.7rem;white-space:nowrap;box-shadow:0 4px 10px -3px rgba(245,158,11,.5)}
 .weak-q-item .wq-opts{display:grid;gap:5px;margin:10px 0}
 .weak-q-item .wq-opt{padding:7px 9px;border-radius:10px;background:var(--sunk);border:1px solid var(--line);font-size:.8rem}
 .weak-q-item .wq-opt.correct{background:var(--oksoft);color:var(--ok);font-weight:700;border-color:transparent}
 .weak-q-item .wq-meta{font-size:.68rem;color:var(--muted);margin-top:8px}
 .pagination{display:flex;gap:5px;justify-content:center;margin:20px 0;flex-wrap:wrap}
-.page-btn{padding:8px 14px;background:var(--card);border:1px solid var(--line);border-radius:9px;font-weight:700;font-size:.85rem;color:var(--text2)}
-.page-btn:hover{border-color:var(--brand);color:var(--brand)}.page-btn.active{background:var(--brand);color:#fff;border-color:var(--brand)}
+.page-btn{padding:8px 14px;background:var(--card);border:1px solid var(--line);border-radius:10px;font-weight:700;font-size:.85rem;color:var(--text2);transition:all .3s var(--ease)}
+.page-btn:hover{border-color:var(--brand);color:var(--brand);transform:translateY(-1px)}
+.page-btn.active{background:var(--grad-brand);color:#fff;border-color:transparent;box-shadow:0 4px 12px -3px rgba(99,102,241,.5)}
 .analytics-chart{display:flex;flex-direction:column;gap:16px;margin-top:20px}
 .bar-row{display:flex;align-items:center;gap:12px}
 .bar-label{width:88px;font-weight:800;font-size:.84rem;flex-shrink:0}
-.bar-track{flex:1;height:26px;background:var(--sunk);border-radius:50px;overflow:hidden}
-.bar-fill{height:100%;background:linear-gradient(90deg,var(--brand),var(--brand2));border-radius:50px;display:flex;align-items:center;justify-content:flex-end;padding-right:9px;color:#fff;font-size:.7rem;font-weight:800;transition:width .9s ease;width:0}
-.tabs{display:flex;gap:4px;padding:4px;background:var(--sunk);border-radius:13px;margin-bottom:16px;overflow-x:auto}
-.tab{padding:10px 16px;border-radius:9px;font-weight:700;font-size:.85rem;color:var(--text2);white-space:nowrap}
-.tab.active{background:var(--card);color:var(--brand);box-shadow:var(--shadow)}
-.tab-panel{display:none}.tab-panel.active{display:block;animation:fadeInUp .3s ease}
-.form-card{display:grid;gap:12px;background:var(--card);border:1px solid var(--line);border-radius:20px;padding:20px;box-shadow:var(--shadow)}
+.bar-track{flex:1;height:26px;background:var(--sunk);border-radius:50px;overflow:hidden;border:1px solid var(--line)}
+.bar-fill{height:100%;background:var(--grad-brand);border-radius:50px;display:flex;align-items:center;justify-content:flex-end;padding-right:9px;color:#fff;font-size:.7rem;font-weight:800;transition:width 1s var(--ease);width:0;min-width:2px}
+.tabs{display:flex;gap:4px;padding:4px;background:var(--sunk);border-radius:14px;margin-bottom:16px;overflow-x:auto}
+.tab{padding:10px 16px;border-radius:10px;font-weight:700;font-size:.85rem;color:var(--text2);white-space:nowrap;transition:all .3s var(--ease)}
+.tab:hover{color:var(--brand)}
+.tab.active{background:var(--card);color:var(--brand);box-shadow:var(--shadowMd);transform:translateY(-1px)}
+.tab-panel{display:none}.tab-panel.active{display:block;animation:fadeInUp .35s var(--ease)}
+.form-card{display:grid;gap:12px;background:var(--card);backdrop-filter:blur(18px) saturate(1.5);border:1px solid var(--line);border-radius:22px;padding:20px;box-shadow:var(--shadowMd)}
 .form-card label{font-weight:700;color:var(--text2);font-size:.84rem;display:block;margin-bottom:4px}
 .form-actions{display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap}.form-actions.between{justify-content:space-between}
 .check-row{display:flex;align-items:center;gap:10px;padding:10px 12px;background:var(--sunk);border-radius:11px}
 .check-row input{width:auto}.check-row label{margin:0;cursor:pointer}
-.export-card{background:var(--card);border:1px solid var(--line);border-radius:20px;padding:22px;box-shadow:var(--shadow)}
+.export-card{background:var(--card);backdrop-filter:blur(18px) saturate(1.5);border:1px solid var(--line);border-radius:22px;padding:22px;box-shadow:var(--shadowMd)}
 .export-card h3{font-size:1.1rem;margin-bottom:6px}.export-card p{color:var(--text2);font-size:.85rem;margin-bottom:16px}
 .list-toolbar{display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap}
 .list-toolbar input,.list-toolbar select{flex:1;min-width:140px}
 .questions-list{display:grid;gap:8px}
-.q-row{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;padding:13px;background:var(--card);border:1px solid var(--line);border-radius:15px;box-shadow:var(--shadow)}
-.q-row .q-cat{display:inline-block;padding:2px 9px;border-radius:20px;font-size:.62rem;font-weight:800;background:rgba(79,70,229,.1);color:var(--brand);margin-bottom:6px}
+.q-row{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;padding:13px;background:var(--card);backdrop-filter:blur(14px);border:1px solid var(--line);border-radius:16px;box-shadow:var(--shadow);transition:box-shadow .3s var(--ease),transform .3s var(--ease)}
+.q-row:hover{box-shadow:var(--shadowMd);transform:translateX(2px)}
+.q-row .q-cat{display:inline-block;padding:2px 9px;border-radius:20px;font-size:.62rem;font-weight:800;background:rgba(99,102,241,.12);color:var(--brand);margin-bottom:6px}
 .q-row .q-text{font-weight:700;font-size:.88rem}.q-row .q-ans{font-size:.72rem;color:var(--ok);font-weight:700}
-.q-row .del{padding:4px 9px;border-radius:7px;font-weight:800;font-size:.68rem;border:1px solid var(--line);color:var(--err)}
-.q-row .del:hover{background:var(--err);color:#fff}
-.modal{display:none;position:fixed;inset:0;background:rgba(10,12,30,.55);justify-content:center;align-items:center;z-index:5000;padding:16px;backdrop-filter:blur(4px)}
+.q-row .del{padding:4px 9px;border-radius:7px;font-weight:800;font-size:.68rem;border:1px solid var(--line);color:var(--err);transition:all .3s var(--ease)}
+.q-row .del:hover{background:var(--grad-red);color:#fff;border-color:transparent}
+
+.modal{display:none;position:fixed;inset:0;background:rgba(10,13,32,.5);justify-content:center;align-items:center;z-index:5000;padding:16px;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
 .modal.active{display:flex}
-.modal-content{background:var(--card);padding:26px;border-radius:20px;max-width:430px;width:100%;box-shadow:var(--shadowLg);animation:popIn .3s ease}
-.modal-header{font-size:1.2rem;font-weight:800;margin-bottom:8px}.modal-sub{color:var(--text2);font-size:.85rem;margin-bottom:16px}
+.modal-content{background:var(--card);backdrop-filter:blur(24px) saturate(1.7);-webkit-backdrop-filter:blur(24px) saturate(1.7);padding:26px;border-radius:24px;max-width:430px;width:100%;box-shadow:var(--shadowLg);animation:modalIn .45s var(--pop);border:1px solid var(--line)}
+.modal-header{font-size:1.2rem;font-weight:800;margin-bottom:8px;letter-spacing:-.01em}.modal-sub{color:var(--text2);font-size:.85rem;margin-bottom:16px}
 .modal-footer{display:flex;gap:8px;margin-top:20px;justify-content:flex-end}
-.loading-overlay{position:fixed;inset:0;background:rgba(10,12,30,.5);display:none;justify-content:center;align-items:center;z-index:9999;backdrop-filter:blur(4px)}
+.modal-shake{animation:shake .5s var(--ease)}
+.lock-icon{width:64px;height:64px;border-radius:50%;margin:0 auto 16px;display:grid;place-items:center;font-size:1.7rem;background:linear-gradient(135deg,rgba(99,102,241,.16),rgba(217,70,239,.14));border:1px solid rgba(99,102,241,.32);animation:lockPulse 2.4s var(--ease) infinite}
+.lock-error{color:var(--err);font-size:.8rem;margin-top:10px;font-weight:600}
+.dest-row{display:flex;gap:8px}
+.dest-row select{flex:1}
+.dest-new{display:flex;gap:8px;align-items:center;flex-wrap:wrap;animation:fadeInUp .35s var(--ease)}
+.new-badge{display:inline-flex;align-items:center;gap:6px;padding:6px 12px;border-radius:50px;background:var(--grad-mint);color:#fff;font-size:.75rem;font-weight:800;box-shadow:0 6px 14px -4px rgba(16,185,129,.5)}
+.badge-pop{animation:badgePop .5s var(--pop)}
+.dest-change{font-size:.72rem;color:var(--muted);text-decoration:underline;cursor:pointer;background:none;border:0}
+.dest-change:hover{color:var(--brand)}
+.tests-list{display:grid;gap:12px}
+.test-card{display:flex;align-items:center;gap:16px;padding:18px 20px;border-radius:22px;background:var(--card);backdrop-filter:blur(16px) saturate(1.5);border:1px solid var(--line);cursor:pointer;text-align:left;width:100%;box-shadow:var(--shadowMd);position:relative;overflow:hidden;transition:transform .4s var(--ease),box-shadow .4s var(--ease),border-color .4s var(--ease)}
+.test-card::after{content:"";position:absolute;top:0;left:0;right:0;height:1px;background:linear-gradient(90deg,transparent,rgba(255,255,255,.55),transparent)}
+.test-card:hover{transform:translateY(-4px);box-shadow:var(--shadowLg);border-color:rgba(99,102,241,.35)}
+.test-card:active{transform:scale(.985)}
+.tc-num{width:52px;height:52px;border-radius:16px;display:grid;place-items:center;font-weight:800;font-size:1.1rem;color:#fff;background:var(--grad-brand);box-shadow:0 8px 18px -6px rgba(99,102,241,.55);flex-shrink:0;transition:transform .4s var(--pop)}
+.test-card:hover .tc-num{transform:scale(1.07) rotate(-4deg)}
+.test-card h4{font-weight:800;font-size:1rem;margin-bottom:2px}
+.tc-meta{color:var(--text2);font-size:.8rem}
+.tc-full .tc-num{background:var(--grad-amber);box-shadow:0 8px 18px -6px rgba(245,158,11,.55)}
+.import-result{text-align:center;padding:34px 26px}
+.import-result h3{font-size:1.15rem;font-weight:800;margin-top:6px;letter-spacing:-.01em}
+.import-result p{color:var(--text2);font-size:.85rem;margin-top:6px}
+.import-check{width:86px;height:86px;border-radius:50%;display:grid;place-items:center;margin:0 auto 6px;background:var(--grad-mint);box-shadow:0 12px 30px -8px rgba(16,185,129,.55);animation:popIn .5s var(--pop)}
+.import-check svg{width:44px;height:44px;stroke:#fff;stroke-width:4;stroke-linecap:round;stroke-linejoin:round;fill:none}
+.import-check path{stroke-dasharray:48;stroke-dashoffset:48;animation:drawCheck .5s var(--ease) .15s forwards}
+.loading-overlay{position:fixed;inset:0;background:rgba(10,13,32,.5);display:none;justify-content:center;align-items:center;z-index:9999;backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
 .loading-overlay.active{display:flex}
-.loading-box{background:var(--card);padding:32px;border-radius:18px;text-align:center;animation:popIn .3s ease}
+.loading-box{background:var(--card);backdrop-filter:blur(24px);padding:32px;border-radius:20px;text-align:center;animation:modalIn .4s var(--pop);border:1px solid var(--line);box-shadow:var(--shadowLg)}
 .spinner{border:4px solid var(--sunk);border-top:4px solid var(--brand);border-radius:50%;width:46px;height:46px;animation:spin 1s linear infinite;margin:0 auto 14px}
-@keyframes spin{0%{transform:rotate(0)}100%{transform:rotate(360deg)}}
-.toast{position:fixed;left:50%;bottom:84px;transform:translate(-50%,150%);padding:12px 18px;border-radius:12px;background:var(--text);color:#fff;font-weight:700;font-size:.85rem;box-shadow:var(--shadowLg);z-index:100;pointer-events:none;opacity:0;transition:.3s;max-width:calc(100% - 32px)}
-.toast.show{transform:translate(-50%,0);opacity:1}.toast.success{background:var(--ok)}.toast.error{background:var(--err)}
+.toast{position:fixed;left:50%;bottom:84px;transform:translate(-50%,150%);padding:12px 18px;border-radius:14px;background:color-mix(in srgb,var(--text) 92%,transparent);color:#fff;font-weight:700;font-size:.85rem;box-shadow:var(--shadowLg);z-index:100;pointer-events:none;opacity:0;transition:transform .45s var(--ease),opacity .45s var(--ease);max-width:calc(100% - 32px);backdrop-filter:blur(10px)}
+.toast.show{transform:translate(-50%,0);opacity:1}.toast.success{background:var(--grad-mint)}.toast.error{background:var(--grad-red)}
 #confetti{position:fixed;inset:0;pointer-events:none;z-index:99}
 kbd{font-family:var(--mono);font-size:.68rem;padding:2px 6px;border-radius:6px;border:1px solid var(--line);background:var(--sunk)}
-@media(min-width:700px){.desktop-nav{display:flex!important}}
+
+.grid-2>*,.quick-stats>*,.subtopic-grid>*,.tests-list>*,.recent-list>*{animation:fadeInUp .5s var(--ease) backwards}
+.grid-2>*:nth-child(2),.quick-stats>*:nth-child(2),.subtopic-grid>*:nth-child(2),.tests-list>*:nth-child(2),.recent-list>*:nth-child(2){animation-delay:.05s}
+.grid-2>*:nth-child(3),.quick-stats>*:nth-child(3),.subtopic-grid>*:nth-child(3),.tests-list>*:nth-child(3),.recent-list>*:nth-child(3){animation-delay:.1s}
+.grid-2>*:nth-child(4),.quick-stats>*:nth-child(4),.subtopic-grid>*:nth-child(4),.tests-list>*:nth-child(4),.recent-list>*:nth-child(4){animation-delay:.15s}
+.grid-2>*:nth-child(5),.tests-list>*:nth-child(5),.recent-list>*:nth-child(5){animation-delay:.2s}
+.grid-2>*:nth-child(6),.tests-list>*:nth-child(6),.recent-list>*:nth-child(6){animation-delay:.25s}
+.grid-2>*:nth-child(7),.tests-list>*:nth-child(7),.recent-list>*:nth-child(7){animation-delay:.3s}
+.grid-2>*:nth-child(8),.tests-list>*:nth-child(8),.recent-list>*:nth-child(8){animation-delay:.35s}
+.tests-list>*:nth-child(9){animation-delay:.4s}
+.tests-list>*:nth-child(10){animation-delay:.45s}
+
+@media(prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}
+}
 </style>
 </head>
 <body>
@@ -986,22 +1172,33 @@ kbd{font-family:var(--mono);font-size:.68rem;padding:2px 6px;border-radius:6px;b
 
 <div class="loading-overlay" id="loadingOverlay"><div class="loading-box"><div class="spinner"></div><p style="font-weight:600;color:var(--text2)">Loading…</p></div></div>
 
-<div class="modal" id="passwordModal">
+<div class="modal" id="lockModal">
   <div class="modal-content">
-    <div class="modal-header">🔐 Export password</div>
-    <p class="modal-sub">Download all questions as a JSON file.</p>
-    <input type="password" id="exportPassword" placeholder="Password" autocomplete="off">
+    <div class="lock-icon">🔒</div>
+    <div class="modal-header" id="lockTitle" style="text-align:center">Restricted action</div>
+    <p class="modal-sub" id="lockSub" style="text-align:center">Enter the access code to continue.</p>
+    <input type="password" id="lockPassword" placeholder="Access code" autocomplete="off" autocapitalize="off" spellcheck="false">
+    <p class="lock-error" id="lockError" hidden></p>
     <div class="modal-footer">
-      <button class="btn-ghost" onclick="closePasswordModal()">Cancel</button>
-      <button class="btn-primary" onclick="submitExportPassword()">Export</button>
+      <button class="btn-ghost" onclick="closeLockModal()">Cancel</button>
+      <button class="btn-primary" id="lockConfirmBtn" onclick="submitLock()">Continue</button>
     </div>
+  </div>
+</div>
+
+<div class="modal" id="importModal">
+  <div class="modal-content import-result">
+    <div id="importAnimWrap"><div class="spinner"></div></div>
+    <h3 id="importTitle">Importing…</h3>
+    <p id="importMsg">Saving questions to the bank.</p>
+    <p id="importSub"></p>
   </div>
 </div>
 
 <div class="modal" id="testConfigModal">
   <div class="modal-content">
-    <div class="modal-header">⚙️ Test setup</div>
-    <p class="modal-sub" id="configDesc">Customise your test.</p>
+    <div class="modal-header">⚙️ Practice setup</div>
+    <p class="modal-sub" id="configDesc">Customise your practice session.</p>
     <div class="form-card" style="padding:0;gap:14px">
       <div><label>Number of questions</label>
         <select id="configLimit">
@@ -1011,17 +1208,10 @@ kbd{font-family:var(--mono);font-size:.68rem;padding:2px 6px;border-radius:6px;b
           <option value="50">50 questions</option>
         </select>
       </div>
-      <div><label>Mode</label>
-        <select id="configMode">
-          <option value="normal">Normal · all questions</option>
-          <option value="weak">Weak Practice · missed once</option>
-          <option value="hard">Hard Drill · missed twice</option>
-        </select>
-      </div>
     </div>
     <div class="modal-footer">
       <button class="btn-ghost" onclick="closeTestConfig()">Cancel</button>
-      <button class="btn-primary" onclick="startCustomTest()">Start test</button>
+      <button class="btn-primary" onclick="startCustomTest()">Start practice</button>
     </div>
   </div>
 </div>
@@ -1084,6 +1274,15 @@ kbd{font-family:var(--mono);font-size:.68rem;padding:2px 6px;border-radius:6px;b
     </div>
   </div>
   <div id="topicList" class="subtopic-grid"></div>
+</div></section>
+
+<section id="testsScreen" class="screen"><div class="container">
+  <div class="page-head">
+    <div><p class="eyebrow" id="testsCatName"></p><h2 class="page-title" id="testsTopicTitle">Tests</h2></div>
+    <button class="btn-ghost" onclick="nav('topics')">← Topics</button>
+  </div>
+  <p id="testsMeta" style="color:var(--text2);font-size:.85rem;margin-bottom:16px"></p>
+  <div id="testsList" class="tests-list"></div>
 </div></section>
 
 <section id="testScreen" class="screen">
@@ -1176,13 +1375,27 @@ kbd{font-family:var(--mono);font-size:.68rem;padding:2px 6px;border-radius:6px;b
       <div><label>Category</label>
         <select id="bulkCategory"><option>GK</option><option>Maths</option><option>English</option><option>Reasoning</option><option>Science</option></select>
       </div>
-      <div class="check-row"><input type="checkbox" id="autoSplit" checked><label for="autoSplit">Auto-split into tests of 20 questions</label></div>
+      <div>
+        <label>Destination topic</label>
+        <div class="dest-row">
+          <select id="destTopic"><option value="">Choose a topic…</option></select>
+          <button id="addTopicToggle" class="btn-ghost" type="button" onclick="toggleNewTopic()">+ New</button>
+        </div>
+        <div id="destNewRow" class="dest-new hidden">
+          <input id="newTopicInput" placeholder="New topic name" autocomplete="off" style="flex:1;min-width:170px">
+          <button id="addTopicBtn" class="btn-primary" type="button" onclick="addNewTopic()">Add</button>
+        </div>
+        <div style="display:flex;align-items:center;gap:10px;margin-top:8px;min-height:20px">
+          <span id="newTopicBadge" class="new-badge hidden"></span>
+          <button id="destChange" class="dest-change hidden" type="button" onclick="resetDest()">change</button>
+        </div>
+      </div>
       <div><label>JSON text</label>
-        <textarea id="bulkText" rows="9" placeholder='[{"question":"...","options":["A","B","C","D"],"correct":0,"explanation":"..."}]'></textarea>
+        <textarea id="bulkText" rows="9" placeholder='Paste JSON: [{"question":"...","options":["A","B","C","D"],"correct":0,"explanation":"..."}]'></textarea>
       </div>
       <div class="form-actions between">
-        <button id="sampleBtn" class="btn-ghost">📄 Load sample</button>
-        <button id="importBtn" class="btn-primary">Import questions</button>
+        <button id="sampleBtn" class="btn-ghost" type="button">📄 Load sample</button>
+        <button id="importBtn" class="btn-primary" type="button">Import questions</button>
       </div>
     </div>
   </div>
@@ -1191,8 +1404,7 @@ kbd{font-family:var(--mono);font-size:.68rem;padding:2px 6px;border-radius:6px;b
       <h3>📥 Export all questions</h3>
       <p>Download the whole bank as a JSON file for backup or moving to another machine.</p>
       <div style="display:flex;gap:8px;flex-wrap:wrap">
-        <button class="btn-primary" onclick="showPasswordModal()">📥 Export JSON</button>
-        <span style="align-self:center;color:var(--muted);font-size:.78rem">🔒 Password: <kbd>121520</kbd></span>
+        <button class="btn-primary" onclick="openLockModal('export')">📥 Export JSON</button>
       </div>
     </div>
   </div>
@@ -1231,10 +1443,14 @@ kbd{font-family:var(--mono);font-size:.68rem;padding:2px 6px;border-radius:6px;b
 const state = {
   username: localStorage.getItem('mtp_user') || '',
   currentCategory: '',
+  currentTopic: '',
   currentTest: null,
   timerInt: null,
   weakPage: 1,
   pendingConfig: null,
+  pendingLock: null,
+  lockedDest: '',
+  importing: false,
 };
 let audioCtx = null;
 
@@ -1267,6 +1483,7 @@ function playSound(type) {
 }
 function vibrate(ms) { if (navigator.vibrate) navigator.vibrate(ms); }
 
+// ---------- navigation ----------
 function nav(screen) {
   history.pushState({}, '', '#' + screen);
   renderScreen(screen);
@@ -1276,12 +1493,15 @@ window.addEventListener('popstate', () => {
 });
 
 function renderScreen(id) {
+  if (id === 'tests' && !state.currentTopic) id = 'topics';
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
-  const map = { welcome:'welcomeScreen', dashboard:'dashboardScreen', categories:'categoriesScreen', topics:'topicsScreen', test:'testScreen', result:'resultScreen', manage:'manageScreen', weaklist:'weaklistScreen', analytics:'analyticsScreen' };
+  const map = { welcome:'welcomeScreen', dashboard:'dashboardScreen', categories:'categoriesScreen', topics:'topicsScreen', tests:'testsScreen', test:'testScreen', result:'resultScreen', manage:'manageScreen', weaklist:'weaklistScreen', analytics:'analyticsScreen' };
   const el = document.getElementById(map[id]);
   if (el) el.classList.add('active');
   if (id === 'dashboard') renderDashboard();
   if (id === 'categories') renderCategories();
+  if (id === 'topics') renderTopics();
+  if (id === 'tests') renderTests();
   if (id === 'manage') renderManage();
   if (id === 'weaklist') loadWeakList(1);
   if (id === 'analytics') renderAnalytics();
@@ -1347,7 +1567,7 @@ async function renderDashboard() {
   } catch (e) {}
 
   document.getElementById('actionGrid').innerHTML = `
-    <button class="action-card" onclick="nav('categories')"><div class="ac-icon g1">🎯</div><h3>Start a test</h3><p>Pick a subject & topic.</p><span class="ac-arrow">→</span></button>
+    <button class="action-card" onclick="nav('categories')"><div class="ac-icon g1">🎯</div><h3>Start a test</h3><p>Subject → topic → test.</p><span class="ac-arrow">→</span></button>
     <button class="action-card" onclick="openTestConfig('weak')"><div class="ac-icon g4">🔥</div><h3>Weak practice</h3><p>Questions you missed.</p><span class="ac-arrow">→</span></button>
     <button class="action-card" onclick="openTestConfig('hard')"><div class="ac-icon g5">💪</div><h3>Hard drill</h3><p>Missed twice or more.</p><span class="ac-arrow">→</span></button>
     <button class="action-card" onclick="nav('weaklist')"><div class="ac-icon g3">📚</div><h3>Weak bank</h3><p>Review all misses.</p><span class="ac-arrow">→</span></button>
@@ -1374,7 +1594,7 @@ async function renderDashboard() {
   } catch (e) { rl.innerHTML = '<div class="empty">Could not load results.</div>'; }
 }
 
-// ---------- categories / topics ----------
+// ---------- 3-tier flow: categories -> topics -> tests ----------
 function renderCategories() {
   const grid = document.getElementById('categoryGrid');
   const icons = ['🌍', '🔢', '🇬🇧', '🧩', '🔬'];
@@ -1391,53 +1611,97 @@ function renderCategories() {
 
 function openCategory(cat) {
   state.currentCategory = cat;
+  state.currentTopic = '';
   nav('topics');
+}
+
+function renderTopics() {
+  const cat = state.currentCategory;
   document.getElementById('topicCatName').textContent = cat;
   const list = document.getElementById('topicList');
   list.innerHTML = '<div class="skeleton-card"></div><div class="skeleton-card"></div><div class="skeleton-card"></div>';
   fetch(`/api/topics?category=${encodeURIComponent(cat)}`).then(r => r.json()).then(topics => {
     if (!topics.length) { list.innerHTML = '<div class="empty">No topics in this category yet.</div>'; return; }
     list.innerHTML = topics.map(t => `
-      <button class="subtopic-tile" onclick="openTestConfig('normal','${esc(cat)}','${esc(t.topic)}')">
-        <h4>${esc(t.topic)}</h4><span>${t.count} questions · ${Math.max(1, Math.ceil(t.count / 2))} min</span>
+      <button class="subtopic-tile" onclick="openTests('${esc(cat)}','${esc(t.topic)}')">
+        <h4>${esc(t.topic)}</h4>
+        <span>${t.count} questions · ${Math.max(1, Math.ceil(t.count / 20))} test${t.count > 20 ? 's' : ''}</span>
       </button>`).join('');
   }).catch(() => { list.innerHTML = '<div class="empty">Failed to load topics.</div>'; });
-  document.getElementById('allTopicBtn').onclick = () => openTestConfig('all', cat);
+  document.getElementById('allTopicBtn').onclick = () => startTest(cat, null, 'all', 0);
 }
 
-// ---------- test config ----------
+function openTests(cat, topic) {
+  state.currentCategory = cat;
+  state.currentTopic = topic;
+  nav('tests');
+}
+
+async function renderTests() {
+  const cat = state.currentCategory, topic = state.currentTopic;
+  document.getElementById('testsCatName').textContent = cat;
+  document.getElementById('testsTopicTitle').textContent = topic;
+  const list = document.getElementById('testsList');
+  list.innerHTML = '<div class="skeleton-card"></div><div class="skeleton-card"></div>';
+  document.getElementById('testsMeta').textContent = '';
+  try {
+    const data = await (await fetch(`/api/tests?category=${encodeURIComponent(cat)}&topic=${encodeURIComponent(topic)}`)).json();
+    document.getElementById('testsMeta').textContent =
+      `${data.total} questions · ${data.tests.length} test${data.tests.length > 1 ? 's' : ''} · 30s per question`;
+    let html = data.tests.map(t => `
+      <button class="test-card" onclick="startChunkTest('${esc(cat)}','${esc(topic)}',${t.n})">
+        <div class="tc-num">${t.n}</div>
+        <div style="flex:1">
+          <h4>Test ${t.n}</h4>
+          <span class="tc-meta">${t.count} questions (Q${t.from}–${t.to}) · ${Math.round(t.timer_sec / 60)} min</span>
+        </div>
+        <span class="ac-arrow">→</span>
+      </button>`).join('');
+    if (data.total > 20) {
+      html += `
+      <button class="test-card tc-full" onclick="startTest('${esc(cat)}','${esc(topic)}','full_topic',0)">
+        <div class="tc-num">∞</div>
+        <div style="flex:1"><h4>Full topic · mixed</h4>
+        <span class="tc-meta">All ${data.total} questions, shuffled · ${Math.round(data.full_timer_sec / 60)} min</span></div>
+        <span class="ac-arrow">→</span>
+      </button>`;
+    }
+    list.innerHTML = html;
+  } catch (e) { list.innerHTML = '<div class="empty">Failed to load tests.</div>'; }
+}
+
+function startChunkTest(cat, topic, chunk) { startTest(cat, topic, 'chunk', 0, chunk); }
+
+// ---------- practice config (weak / hard only) ----------
 function openTestConfig(mode, cat = null, topic = null) {
   state.pendingConfig = { mode, cat, topic };
-  const desc = {
-    normal: `Timed test from “${topic}” with instant answers & explanations.`,
-    all: `Every question in ${cat}, shuffled — the full exam experience.`,
-    weak: 'Questions you missed before. Retrain those weak spots now.',
-    hard: 'Only questions missed at least twice. Get them right to clear them.',
-  }[mode];
-  document.getElementById('configDesc').textContent = desc;
-  const ms = document.getElementById('configMode');
-  ms.value = (mode === 'normal' || mode === 'all') ? 'normal' : mode;
-  ms.disabled = !(mode === 'weak' || mode === 'hard');
+  document.getElementById('configDesc').textContent =
+    mode === 'hard'
+      ? 'Only questions missed at least twice. Get them right to clear them.'
+      : 'Questions you missed before. Retrain those weak spots now.';
   document.getElementById('testConfigModal').classList.add('active');
 }
 function closeTestConfig() { document.getElementById('testConfigModal').classList.remove('active'); state.pendingConfig = null; }
 function startCustomTest() {
   const cfg = state.pendingConfig;
   const limit = parseInt(document.getElementById('configLimit').value);
-  const mode = document.getElementById('configMode').value;
   closeTestConfig();
-  startTest(cfg.cat, cfg.topic, mode, limit);
+  startTest(cfg.cat, cfg.topic, cfg.mode, limit);
 }
 
-async function startTest(cat, topic, mode, limit = 20) {
+async function startTest(cat, topic, mode, limit = 20, chunk = 1) {
   showLoading(true);
   try {
     const res = await fetch('/api/start-test', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: state.username, category: cat, topic, mode, limit }),
+      body: JSON.stringify({ username: state.username, category: cat, topic, mode, limit, chunk }),
     });
     const data = await res.json();
     if (!res.ok) { toast(data.error || 'Error', 'error'); return; }
+    const isChunk = data.mode === 'chunk';
+    const label = isChunk ? (topic || '') + ' · Test ' + (data.chunk || 1)
+      : mode === 'full_topic' ? (topic || '') + ' · Full'
+      : topic || cat || '';
     state.currentTest = {
       questions: data.questions,
       answers: new Array(data.questions.length).fill(null),
@@ -1445,8 +1709,10 @@ async function startTest(cat, topic, mode, limit = 20) {
       startAt: Date.now(),
       timerSec: data.timer_sec,
       mode: data.mode,
+      chunk: data.chunk || 1,
       category: cat || data.questions[0].category,
-      topic: topic || '',
+      topic: label,
+      rawTopic: topic || '',
     };
     nav('test');
     renderTestQuestion();
@@ -1638,8 +1904,9 @@ document.getElementById('retakeBtn').addEventListener('click', () => {
   const t = state.currentTest;
   if (!t) return;
   if (t.mode === 'weak' || t.mode === 'hard') openTestConfig(t.mode);
-  else if (t.mode === 'normal' && t.topic) openTestConfig('normal', t.category, t.topic);
-  else openTestConfig('all', t.category);
+  else if (t.mode === 'chunk') startChunkTest(t.category, t.rawTopic, t.chunk);
+  else if (t.mode === 'full_topic') startTest(t.category, t.rawTopic, 'full_topic', 0);
+  else if (t.mode === 'all') startTest(t.category, null, 'all', 0);
 });
 
 // ---------- weak questions ----------
@@ -1703,27 +1970,212 @@ function switchTab(name) {
   const panel = document.getElementById('tab-' + name);
   if (panel) panel.classList.add('active');
   if (name === 'list') renderManage();
+  if (name === 'bulk') refreshDestTopics();
 }
 document.querySelectorAll('.tab').forEach(t => t.addEventListener('click', () => switchTab(t.dataset.tab)));
 
-document.getElementById('importBtn').addEventListener('click', async () => {
-  const category = document.getElementById('bulkCategory').value;
-  const autoSplit = document.getElementById('autoSplit').checked;
-  const raw = document.getElementById('bulkText').value.trim();
-  if (!raw) { toast('Paste some JSON first', 'error'); return; }
+// ---------- bulk import: destination topic selector ----------
+async function refreshDestTopics() {
+  const sel = document.getElementById('destTopic');
+  const cat = document.getElementById('bulkCategory').value;
+  const prev = sel.value;
+  sel.innerHTML = '<option value="">Choose a topic…</option>';
   try {
-    const arr = JSON.parse(raw);
-    if (!Array.isArray(arr)) throw new Error();
-    const res = await fetch('/api/import-questions', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ category, auto_split: autoSplit, questions: arr }),
-    });
-    const d = await res.json();
-    if (!res.ok) { toast(d.error || 'Error', 'error'); return; }
-    toast(`${d.added} questions imported ✓`, 'success');
-    document.getElementById('bulkText').value = '';
-  } catch (e) { toast('Invalid JSON format', 'error'); }
+    const tops = await (await fetch(`/api/topics?category=${encodeURIComponent(cat)}`)).json();
+    sel.innerHTML = '<option value="">Choose a topic…</option>' +
+      tops.map(t => `<option value="${esc(t.topic)}">${esc(t.topic)} · ${t.count} Q</option>`).join('');
+    if (prev && [...sel.options].some(o => o.value === prev)) sel.value = prev;
+  } catch (e) {}
+}
+function toggleNewTopic() {
+  const row = document.getElementById('destNewRow');
+  row.classList.toggle('hidden');
+  if (!row.classList.contains('hidden')) document.getElementById('newTopicInput').focus();
+}
+function addNewTopic() {
+  const name = document.getElementById('newTopicInput').value.trim();
+  const badge = document.getElementById('newTopicBadge');
+  const sel = document.getElementById('destTopic');
+  if (!name) { toast('Enter a topic name', 'error'); return; }
+  const exists = [...sel.options].some(o => o.value === name);
+  sel.value = name;
+  if (exists) {
+    badge.textContent = 'Already exists — selected';
+  } else {
+    sel.insertAdjacentHTML('beforeend', `<option value="${esc(name)}">${esc(name)} · new</option>`);
+    state.lockedDest = name;
+    badge.textContent = '✨ New created!';
+    document.getElementById('addTopicToggle').classList.add('hidden');
+    document.getElementById('destNewRow').classList.add('hidden');
+    sel.disabled = true;
+    document.getElementById('destChange').classList.remove('hidden');
+  }
+  badge.classList.remove('hidden');
+  badge.classList.remove('badge-pop');
+  void badge.offsetWidth;
+  badge.classList.add('badge-pop');
+  document.getElementById('newTopicInput').value = '';
+}
+function resetDest() {
+  state.lockedDest = '';
+  const sel = document.getElementById('destTopic');
+  sel.disabled = false;
+  document.getElementById('addTopicToggle').classList.remove('hidden');
+  document.getElementById('destNewRow').classList.add('hidden');
+  document.getElementById('destChange').classList.add('hidden');
+  document.getElementById('newTopicBadge').classList.add('hidden');
+  document.getElementById('newTopicInput').value = '';
+}
+document.getElementById('bulkCategory').addEventListener('change', () => { resetDest(); refreshDestTopics(); });
+document.getElementById('newTopicInput').addEventListener('keypress', e => { if (e.key === 'Enter') { e.preventDefault(); addNewTopic(); } });
+
+// ---------- bulk import: protected, duplicate-safe, animated ----------
+function resetImportBtn() {
+  const btn = document.getElementById('importBtn');
+  btn.disabled = false;
+  btn.innerHTML = 'Import questions';
+}
+document.getElementById('importBtn').addEventListener('click', () => {
+  if (state.importing) return;
+  state.importing = true;
+  const btn = document.getElementById('importBtn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="btn-spinner"></span> Importing…';
+  const raw = document.getElementById('bulkText').value.trim();
+  let arr;
+  try { arr = JSON.parse(raw); if (!Array.isArray(arr)) throw new Error(); }
+  catch (e) { resetImportBtn(); state.importing = false; toast('Invalid JSON — paste an array of questions', 'error'); return; }
+  if (!arr.length) { resetImportBtn(); state.importing = false; toast('The JSON array is empty', 'error'); return; }
+  const topic = state.lockedDest || document.getElementById('destTopic').value;
+  if (!topic) { resetImportBtn(); state.importing = false; toast('Choose a destination topic first', 'error'); return; }
+  openLockModal('import');
 });
+
+async function doImport(password) {
+  const category = document.getElementById('bulkCategory').value;
+  const topic = state.lockedDest || document.getElementById('destTopic').value;
+  const arr = JSON.parse(document.getElementById('bulkText').value.trim());
+  const res = await fetch('/api/import-questions', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password, category, topic, questions: arr }),
+  });
+  const d = await res.json().catch(() => ({}));
+  if (res.status === 401) throw 'wrong-code';
+  if (!res.ok) throw new Error(d.error || 'Import failed');
+  return d;
+}
+
+function openImportModal(spinning) {
+  document.getElementById('importAnimWrap').innerHTML = '<div class="spinner"></div>';
+  document.getElementById('importTitle').textContent = spinning ? 'Importing…' : '';
+  document.getElementById('importMsg').textContent = spinning ? 'Saving questions to the bank.' : '';
+  document.getElementById('importSub').textContent = '';
+  document.getElementById('importModal').classList.add('active');
+}
+function closeImportModal() { document.getElementById('importModal').classList.remove('active'); }
+function renderImportOutcome(d) {
+  document.getElementById('importAnimWrap').innerHTML =
+    `<div class="import-check"><svg viewBox="0 0 24 24"><path d="M4 12.5l5 5L20 6.5"/></svg></div>`;
+  document.getElementById('importTitle').textContent =
+    d.added ? 'Questions imported successfully' : 'Nothing new added';
+  document.getElementById('importMsg').textContent = d.added
+    ? (d.duplicates ? `✨ ${d.added} new · ${d.duplicates} duplicate${d.duplicates > 1 ? 's' : ''} skipped` : `✨ ${d.added} question${d.added > 1 ? 's' : ''} saved`)
+    : `All ${d.duplicates} were already in the bank — no duplicates created.`;
+  document.getElementById('importSub').textContent = `→ ${esc(d.category)} / ${esc(d.topic)}`;
+  setTimeout(() => closeImportModal(), 2400);
+}
+
+// ---------- secret access-code gate (import + export) ----------
+function openLockModal(action) {
+  state.pendingLock = action;
+  document.getElementById('lockTitle').textContent = action === 'export' ? 'Secure export' : 'Secure import';
+  document.getElementById('lockSub').textContent = action === 'export'
+    ? 'Enter the access code to download the question bank.'
+    : 'Enter the access code to save questions to the bank.';
+  document.getElementById('lockError').hidden = true;
+  document.getElementById('lockPassword').value = '';
+  document.getElementById('lockModal').classList.add('active');
+  setTimeout(() => document.getElementById('lockPassword').focus(), 120);
+}
+function closeLockModal() {
+  document.getElementById('lockModal').classList.remove('active');
+  document.getElementById('lockPassword').value = '';
+  document.getElementById('lockError').hidden = true;
+  const c = document.getElementById('lockConfirmBtn');
+  c.disabled = false;
+  c.innerHTML = 'Continue';
+  state.pendingLock = null;
+}
+function shakeLock() {
+  const box = document.querySelector('#lockModal .modal-content');
+  box.classList.remove('modal-shake');
+  void box.offsetWidth;
+  box.classList.add('modal-shake');
+}
+async function submitLock() {
+  const password = document.getElementById('lockPassword').value;
+  const action = state.pendingLock;
+  if (!password) {
+    document.getElementById('lockError').textContent = 'Enter the access code.';
+    document.getElementById('lockError').hidden = false;
+    shakeLock();
+    return;
+  }
+  const btn = document.getElementById('lockConfirmBtn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="btn-spinner"></span> Checking…';
+  if (action === 'export') {
+    try {
+      const ok = await doExport(password);
+      if (ok) { closeLockModal(); resetImportBtn(); state.importing = false; }
+      else { btn.disabled = false; btn.innerHTML = 'Continue'; document.getElementById('lockError').textContent = 'Incorrect access code.'; document.getElementById('lockError').hidden = false; document.getElementById('lockPassword').value = ''; document.getElementById('lockPassword').focus(); shakeLock(); }
+    } catch (e) { btn.disabled = false; btn.innerHTML = 'Continue'; closeLockModal(); resetImportBtn(); state.importing = false; toast(e.message || 'Export failed', 'error'); }
+    return;
+  }
+  if (action === 'import') {
+    closeLockModal();
+    openImportModal(true);
+    try {
+      const outcome = await doImport(password);
+      renderImportOutcome(outcome);
+      document.getElementById('bulkText').value = '';
+      resetImportBtn();
+      state.importing = false;
+      renderManage();
+      refreshDestTopics();
+    } catch (e) {
+      closeImportModal();
+      resetImportBtn();
+      state.importing = false;
+      if (e === 'wrong-code') { openLockModal('import'); setTimeout(() => { document.getElementById('lockError').textContent = 'Incorrect access code.'; document.getElementById('lockError').hidden = false; shakeLock(); }, 260); }
+      else toast(e.message || 'Import failed', 'error');
+    }
+  }
+}
+
+async function doExport(password) {
+  const res = await fetch('/api/export-all', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ password }),
+  });
+  if (res.status === 401) return false;
+  if (!res.ok) { const d = await res.json().catch(() => ({})); throw new Error(d.error || 'Export failed'); }
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `questions_export_${Date.now()}.json`;
+  document.body.appendChild(a);
+  a.click();
+  URL.revokeObjectURL(url);
+  a.remove();
+  toast('Export ready ✓', 'success');
+  return true;
+}
+document.getElementById('lockPassword').addEventListener('keypress', e => { if (e.key === 'Enter') submitLock(); });
+document.getElementById('lockModal').addEventListener('click', e => { if (e.target.id === 'lockModal') closeLockModal(); });
+document.getElementById('testConfigModal').addEventListener('click', e => { if (e.target.id === 'testConfigModal') closeTestConfig(); });
+
 document.getElementById('sampleBtn').addEventListener('click', () => {
   document.getElementById('bulkText').value = JSON.stringify([
     { question: 'Sample Q1?', options: ['A', 'B', 'C', 'D'], correct: 0, explanation: 'Sample explanation.' },
@@ -1755,6 +2207,7 @@ async function renderManage() {
         </div>`).join('')
       : '<div class="empty">No questions found.</div>';
   } catch (e) {}
+  refreshDestTopics();
 }
 async function delQ(id) {
   await fetch(`/api/questions/${id}`, { method: 'DELETE' });
@@ -1762,43 +2215,15 @@ async function delQ(id) {
   toast('Question deleted', 'success');
 }
 
-function showPasswordModal() { document.getElementById('passwordModal').classList.add('active'); setTimeout(() => document.getElementById('exportPassword').focus(), 100); }
-function closePasswordModal() { document.getElementById('passwordModal').classList.remove('active'); document.getElementById('exportPassword').value = ''; }
-async function submitExportPassword() {
-  const password = document.getElementById('exportPassword').value;
-  if (!password) { toast('Enter the password', 'error'); return; }
-  showLoading(true);
-  try {
-    const res = await fetch('/api/export-all', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ password }),
-    });
-    if (!res.ok) { toast('Wrong password', 'error'); return; }
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `questions_export_${Date.now()}.json`;
-    document.body.appendChild(a);
-    a.click();
-    URL.revokeObjectURL(url);
-    toast('Export ready ✓', 'success');
-    closePasswordModal();
-  } catch (e) { toast('Export failed', 'error'); } finally { showLoading(false); }
-}
-document.getElementById('exportPassword').addEventListener('keypress', e => { if (e.key === 'Enter') submitExportPassword(); });
-document.getElementById('passwordModal').addEventListener('click', e => { if (e.target.id === 'passwordModal') closePasswordModal(); });
-document.getElementById('testConfigModal').addEventListener('click', e => { if (e.target.id === 'testConfigModal') closeTestConfig(); });
-
 // ---------- github sync ----------
 async function githubSync(action) {
-  const password = prompt('Enter the sync password:');
-  if (!password) return;
+  const accessCode = prompt('Enter the sync access code:');
+  if (!accessCode) return;
   showLoading(true);
   try {
     const res = await fetch('/api/sync', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ action, password }),
+      body: JSON.stringify({ action, password: accessCode }),
     });
     const d = await res.json();
     if (!res.ok) { toast(d.error || 'Sync failed', 'error'); return; }
@@ -1868,10 +2293,10 @@ if __name__ == "__main__":
     print("=" * 52)
     print("  MockTest.pro — Level 99  (single-file edition)")
     print(f"  Database : {DB_PATH}")
+    port = int(os.getenv("PORT", 5000))
     print(f"  Open     : http://127.0.0.1:{port}")
     print("  Stop     : Ctrl+C")
     print("=" * 52)
-    port = int(os.getenv("PORT", 5000))
     app.run(
         host="0.0.0.0",
         port=port,
