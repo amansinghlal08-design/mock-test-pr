@@ -729,7 +729,6 @@ def export_all():
     )
 
 
-# =====================================================================
 @app.route("/api/sync", methods=["POST"])
 def github_sync():
     """Push or pull the question bank + user data via the sync.py bridge."""
@@ -751,6 +750,7 @@ def github_sync():
         return jsonify(error=str(e)), 500
 
 
+# =====================================================================
 # FRONTEND (embedded single-file UI)
 # =====================================================================
 
