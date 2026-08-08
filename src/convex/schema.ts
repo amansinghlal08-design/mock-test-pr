@@ -30,6 +30,10 @@ const schema = defineSchema(
       isAnonymous: v.optional(v.boolean()), // is the user anonymous. do not remove
 
       role: v.optional(roleValidator), // role of the user. do not remove
+
+      // Admin-managed restriction flag. When true, the user is temporarily
+      // banned from taking tests and their stats read as zero.
+      banned: v.optional(v.boolean()),
     }).index("email", ["email"]), // index for the email. do not remove or modify
 
     // Question bank — each question belongs to a category (GK, Maths, ...)

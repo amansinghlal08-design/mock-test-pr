@@ -6,6 +6,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { AdminView } from "@/components/app/AdminView";
 import { AnalyticsView } from "@/components/app/AnalyticsView";
 import { ChunksView } from "@/components/app/ChunksView";
 import { HomeView } from "@/components/app/HomeView";
@@ -15,6 +16,7 @@ import { ResultView } from "@/components/app/ResultView";
 import { SubjectsView } from "@/components/app/SubjectsView";
 import { TestSetupDialog } from "@/components/app/TestSetupDialog";
 import { TestView } from "@/components/app/TestView";
+import { ThemeToggle } from "@/components/app/ThemeToggle";
 import { TopicsView } from "@/components/app/TopicsView";
 import { WeakView } from "@/components/app/WeakView";
 import { api } from "@/convex/_generated/api";
@@ -28,9 +30,12 @@ import {
   Flame,
   Home,
   LogOut,
+  ShieldCheck,
   Trophy,
   Zap,
 } from "lucide-react";
+
+const ADMIN_EMAIL = "amansinghlal08@gmail.com";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router";
 import { toast } from "sonner";
@@ -45,8 +50,15 @@ const NAV_ITEMS: { view: View; label: string; icon: typeof Home }[] = [
   { view: "leaderboard", label: "Rank", icon: Trophy },
 ];
 
+const ADMIN_ITEM: { view: View; label: string; icon: typeof Home } = {
+  view: "admin",
+  label: "Admin",
+  icon: ShieldCheck,
+};
+
 export default function Dashboard() {
   const { user, signOut } = useAuth();
+  const isAdmin = user?.email?.toLowerCase() === ADMIN_EMAIL;
   const navigate = useNavigate();
   const stats = useQuery(api.queries.userStats);
   const seed = useMutation(api.tests.seedIfEmpty);
@@ -184,7 +196,7 @@ export default function Dashboard() {
     const t = activeTest;
     if (!t) return;
     if (t.mode === "weak" || t.mode === "hard") {
-      openConfig({ mode: t.mode as "weak" | "hard" });
+      openConfig({ mode: t.mode as "weak" | "hard" }, stats?.weakCount ?? 20);
     } else if (t.mode === "normal" && t.topic) {
       if (t.chunk) {
         openConfig(
@@ -261,6 +273,7 @@ export default function Dashboard() {
     }
   };
 
+  const navItems = isAdmin ? [...NAV_ITEMS, ADMIN_ITEM] : NAV_ITEMS;
   const userName = user?.name || user?.email?.split("@")[0] || "Student";
 
   return (
@@ -287,14 +300,16 @@ export default function Dashboard() {
 
           {/* desktop nav */}
           <nav className="hidden items-center gap-1 md:flex">
-            {NAV_ITEMS.map((n) => (
+            {navItems.map((n) => (
               <button
                 key={n.view}
                 onClick={() => goTo(n.view)}
                 className={`inline-flex items-center gap-1.5 rounded-full px-4 py-2 text-sm font-semibold transition-colors ${
                   view === n.view
                     ? "bg-primary/10 text-primary"
-                    : "text-muted-foreground hover:bg-muted hover:text-foreground"
+                    : n.view === "admin"
+                      ? "text-violet-500 hover:bg-violet-500/10 hover:text-violet-600 dark:text-violet-400"
+                      : "text-muted-foreground hover:bg-muted hover:text-foreground"
                 }`}
               >
                 <n.icon className="size-4" />
@@ -304,6 +319,7 @@ export default function Dashboard() {
           </nav>
 
           <div className="flex items-center gap-2.5">
+            <ThemeToggle />
             <button
               onClick={() => goTo("leaderboard")}
               className="hidden size-8 items-center justify-center rounded-full border bg-card transition-all hover:-translate-y-0.5 hover:border-amber-400/60 hover:shadow-md sm:inline-flex"
@@ -344,6 +360,14 @@ export default function Dashboard() {
                 <DropdownMenuItem onClick={goHome} className="cursor-pointer">
                   <Home className="mr-2 size-4" /> Home
                 </DropdownMenuItem>
+                {isAdmin && (
+                  <DropdownMenuItem
+                    onClick={() => goTo("admin")}
+                    className="cursor-pointer text-violet-600 focus:text-violet-600 dark:text-violet-400"
+                  >
+                    <ShieldCheck className="mr-2 size-4" /> Admin panel
+                  </DropdownMenuItem>
+                )}
                 <DropdownMenuItem onClick={() => setBankOpen(true)} className="cursor-pointer">
                   <Database className="mr-2 size-4" /> Manage question bank
                 </DropdownMenuItem>
@@ -440,6 +464,10 @@ export default function Dashboard() {
             <motion.div key="leaderboard" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
               <LeaderboardView onBack={goHome} />
             </motion.div>
+          ) : view === "admin" && isAdmin ? (
+            <motion.div key="admin" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
+              <AdminView onBack={goHome} />
+            </motion.div>
           ) : (
             <motion.div key="home" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
               <HomeView
@@ -468,9 +496,9 @@ export default function Dashboard() {
 
       {/* ================= MOBILE BOTTOM NAV ================= */}
       {view !== "test" && (
-        <nav className="fixed inset-x-0 bottom-0 z-40 border-t bg-background/90 pb-[env(safe-area-inset-bottom)] backdrop-blur-lg md:hidden">
-          <div className="flex items-stretch justify-around">
-            {NAV_ITEMS.map((n) => {
+        <nav className="fixed inset-x-0 bottom-0 z-40 px-4 pb-[max(env(safe-area-inset-bottom),0.75rem)] md:hidden">
+          <div className="mx-auto flex max-w-md items-stretch justify-around rounded-2xl border bg-background/85 shadow-2xl shadow-foreground/10 backdrop-blur-xl">
+            {navItems.map((n) => {
               const active =
                 n.view === "subjects" || n.view === "topics" || n.view === "chunks"
                   ? view === "subjects" || view === "topics" || view === "chunks"
@@ -479,11 +507,17 @@ export default function Dashboard() {
                 <button
                   key={n.view}
                   onClick={() => goTo(n.view)}
-                  className={`flex flex-1 flex-col items-center gap-1 py-2.5 text-[11px] font-bold transition-colors ${
+                  className={`flex flex-1 flex-col items-center gap-1 rounded-2xl py-2.5 text-[11px] font-bold transition-colors ${
                     active ? "text-primary" : "text-muted-foreground"
                   }`}
                 >
-                  <n.icon className="size-5" />
+                  <span
+                    className={`grid size-8 place-items-center rounded-xl transition-colors ${
+                      active ? "bg-primary/15" : ""
+                    }`}
+                  >
+                    <n.icon className="size-5" />
+                  </span>
                   {n.label}
                 </button>
               );
@@ -491,6 +525,14 @@ export default function Dashboard() {
           </div>
         </nav>
       )}
+
+      {/* ================= DEVELOPER CREDIT ================= */}
+      <footer className="pb-28 pt-6 text-center md:pb-8">
+        <p className="text-xs font-medium text-muted-foreground/70">
+          Built with <span className="text-rose-500">♥</span> for students ·{" "}
+          <span className="font-bold text-foreground/80">Powered by Rajnish</span>
+        </p>
+      </footer>
 
       {/* starting overlay */}
       {starting && (

@@ -1,8 +1,9 @@
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 import { useEffect, useState } from "react";
 import type { TestConfig, TestMode } from "@/lib/test";
-import { Clock3, SlidersHorizontal } from "lucide-react";
+import { Clock3, Play, SlidersHorizontal } from "lucide-react";
 
 interface TestSetupDialogProps {
   open: boolean;
@@ -12,8 +13,6 @@ interface TestSetupDialogProps {
   available?: number;
   onConfirm: (config: TestConfig, limit: number) => void;
 }
-
-const LIMITS = [10, 20, 30, 50];
 
 export function TestSetupDialog({ open, onOpenChange, config, available, onConfirm }: TestSetupDialogProps) {
   const [limit, setLimit] = useState(20);
@@ -28,14 +27,8 @@ export function TestSetupDialog({ open, onOpenChange, config, available, onConfi
       setLimit(max);
       return;
     }
-    const clamped = Math.min(max, 20);
-    setLimit(
-      LIMITS.includes(clamped)
-        ? clamped
-        : LIMITS.reduce((best, l) =>
-            Math.abs(l - clamped) < Math.abs(best - clamped) ? l : best,
-          LIMITS[0]),
-    );
+    setLimit(Math.min(Math.max(1, Math.round(limit || 20)), max));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, config, available]);
 
   if (!config) return null;
@@ -43,12 +36,7 @@ export function TestSetupDialog({ open, onOpenChange, config, available, onConfi
   const isDrill = config.mode === "weak" || config.mode === "hard";
   const isChunk = !!config.chunk;
   const max = Math.max(1, available ?? 50);
-  const options =
-    max < LIMITS[0]
-      ? [{ value: max, label: `All ${max} questions` }]
-      : LIMITS.filter((l) => l <= max).map((l) => ({ value: l, label: `${l} questions` }));
-  const shown = options.some((o) => o.value === limit) ? limit : options[options.length - 1].value;
-  const safeLimit = Math.min(limit, max);
+  const safeLimit = Math.min(Math.max(1, Math.round(limit || max)), max);
   const timerHint =
     mode === "weak" || mode === "hard"
       ? `${safeLimit} min`
@@ -95,41 +83,80 @@ export function TestSetupDialog({ open, onOpenChange, config, available, onConfi
             </div>
           ) : (
             <div>
-              <label className="mb-1.5 block text-sm font-semibold">
-                Number of questions
-              </label>
-              <select
-                value={shown}
-                onChange={(e) => setLimit(Number(e.target.value))}
-                className="h-11 w-full rounded-xl border bg-background px-3 text-sm font-medium outline-none transition-[border,box-shadow] focus:border-primary focus:ring-3 focus:ring-primary/20"
-              >
-                {options.map((o) => (
-                  <option key={o.value} value={o.value}>
-                    {o.label}
-                  </option>
-                ))}
-              </select>
+              <div className="mb-1.5 flex items-center justify-between">
+                <label htmlFor="test-count" className="text-sm font-semibold">
+                  Number of questions
+                </label>
+                <span className="text-xs font-medium text-muted-foreground">
+                  {max} available
+                </span>
+              </div>
+              <div className="flex gap-2">
+                <Input
+                  id="test-count"
+                  type="number"
+                  min={1}
+                  max={max}
+                  value={limit}
+                  onChange={(e) => setLimit(Number(e.target.value))}
+                  onBlur={() =>
+                    setLimit(Math.min(Math.max(1, Math.round(limit || max)), max))
+                  }
+                  className="h-11 flex-1 text-center text-base font-bold tabular-nums"
+                  aria-label="Number of questions"
+                />
+                <Button
+                  type="button"
+                  variant="outline"
+                  className="h-11 gap-1.5 border-primary/40 px-4 text-primary hover:bg-primary/10"
+                  onClick={() => setLimit(max)}
+                  title={`Use all ${max} questions`}
+                >
+                  <Play className="size-4" /> Play ALL
+                </Button>
+              </div>
+              <p className="mt-1.5 text-[11px] text-muted-foreground">
+                Type any number from 1 to {max} — or play the whole set at once.
+              </p>
             </div>
           )}
 
-          <div>
-            <label className="mb-1.5 block text-sm font-semibold">Mode</label>
-            <select
-              value={mode}
-              disabled={!isDrill}
-              onChange={(e) => setMode(e.target.value as TestMode)}
-              className="h-11 w-full rounded-xl border bg-background px-3 text-sm font-medium outline-none transition-[border,box-shadow] focus:border-primary focus:ring-3 focus:ring-primary/20 disabled:opacity-50"
-            >
-              {isDrill ? (
-                <>
-                  <option value="weak">Weak Practice · missed once</option>
-                  <option value="hard">Hard Drill · missed twice</option>
-                </>
-              ) : (
-                <option value="normal">Normal · all questions</option>
-              )}
-            </select>
-          </div>
+          {isDrill && (
+            <div>
+              <label className="mb-1.5 block text-sm font-semibold">Mode</label>
+              <div className="grid grid-cols-2 gap-2">
+                <button
+                  type="button"
+                  onClick={() => setMode("weak")}
+                  className={`rounded-xl border-2 px-3 py-2.5 text-sm font-bold transition-colors ${
+                    mode === "weak"
+                      ? "border-amber-400 bg-amber-500/10 text-amber-600 dark:text-amber-400"
+                      : "border-input text-muted-foreground hover:border-amber-400/50"
+                  }`}
+                >
+                  Weak practice
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setMode("hard")}
+                  className={`rounded-xl border-2 px-3 py-2.5 text-sm font-bold transition-colors ${
+                    mode === "hard"
+                      ? "border-rose-400 bg-rose-500/10 text-rose-600 dark:text-rose-400"
+                      : "border-input text-muted-foreground hover:border-rose-400/50"
+                  }`}
+                >
+                  Hard drill
+                </button>
+              </div>
+            </div>
+          )}
+
+          {!isDrill && !isChunk && (
+            <div className="flex items-center gap-2 rounded-xl bg-muted px-3.5 py-2.5 text-xs font-semibold text-muted-foreground">
+              <SlidersHorizontal className="size-4 shrink-0 text-primary" />
+              Normal mode · all questions shuffled
+            </div>
+          )}
 
           <div className="flex items-center gap-2 rounded-xl bg-muted px-3.5 py-2.5 text-xs font-semibold text-muted-foreground">
             <Clock3 className="size-4 shrink-0 text-primary" />
@@ -146,10 +173,10 @@ export function TestSetupDialog({ open, onOpenChange, config, available, onConfi
             Cancel
           </Button>
           <Button
-            className="flex-1"
+            className="flex-1 gap-1.5"
             onClick={() => onConfirm({ ...config, mode }, safeLimit)}
           >
-            Start test
+            <Play className="size-4" /> Start test
           </Button>
         </div>
       </DialogContent>

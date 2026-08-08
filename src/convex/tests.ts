@@ -122,6 +122,13 @@ export const startTest = mutation({
     if (userId === null) {
       return { ok: false as const, error: "Please sign in to take a test." };
     }
+    const user = await ctx.db.get(userId);
+    if (user?.banned) {
+      return {
+        ok: false as const,
+        error: "Your account is temporarily restricted. Contact support.",
+      };
+    }
 
     let picked: Doc<"questions">[] = [];
 
@@ -233,6 +240,8 @@ export const submitTest = mutation({
   handler: async (ctx, args) => {
     const userId = await getAuthUserId(ctx);
     if (userId === null) throw new Error("Please sign in.");
+    const user = await ctx.db.get(userId);
+    if (user?.banned) throw new Error("Your account is temporarily restricted.");
 
     let correct = 0;
     let wrong = 0;
@@ -347,6 +356,8 @@ export const clearWeakQuestions = mutation({
   handler: async (ctx) => {
     const userId = await getAuthUserId(ctx);
     if (userId === null) return;
+    const user = await ctx.db.get(userId);
+    if (user?.banned) return;
     const weaks = await ctx.db
       .query("weakQuestions")
       .withIndex("by_user", (qq) => qq.eq("userId", userId))

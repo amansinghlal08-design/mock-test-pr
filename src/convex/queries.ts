@@ -54,6 +54,19 @@ export const userStats = query({
         xpIntoLevel: 0,
       };
     }
+    const user = await ctx.db.get(userId);
+    if (user?.banned) {
+      return {
+        totalQuestions,
+        totalTests: 0,
+        avgPct: 0,
+        weakCount: 0,
+        xp: 0,
+        level: 1,
+        streak: 0,
+        xpIntoLevel: 0,
+      };
+    }
 
     const attempts = await ctx.db
       .query("testAttempts")
@@ -93,6 +106,8 @@ export const recentAttempts = query({
   handler: async (ctx, args) => {
     const userId = await getAuthUserId(ctx);
     if (userId === null) return [];
+    const user = await ctx.db.get(userId);
+    if (user?.banned) return [];
     const attempts = await ctx.db
       .query("testAttempts")
       .withIndex("by_user_ts", (q) => q.eq("userId", userId))
@@ -122,6 +137,8 @@ export const analytics = query({
   handler: async (ctx) => {
     const userId = await getAuthUserId(ctx);
     if (userId === null) return [];
+    const user = await ctx.db.get(userId);
+    if (user?.banned) return [];
     const attempts = await ctx.db
       .query("testAttempts")
       .withIndex("by_user_ts", (q) => q.eq("userId", userId))
@@ -171,7 +188,7 @@ export const leaderboard = query({
 
     for (const s of stats) {
       const u = await ctx.db.get(s.userId);
-      if (!u) continue;
+      if (!u || u.isAnonymous || u.banned) continue;
       const attempts = await ctx.db
         .query("testAttempts")
         .withIndex("by_user_ts", (q) => q.eq("userId", s.userId))
@@ -207,6 +224,10 @@ export const weakQuestions = query({
   handler: async (ctx, args) => {
     const userId = await getAuthUserId(ctx);
     if (userId === null) {
+      return { weakQuestions: [], page: 1, totalPages: 0, total: 0 };
+    }
+    const user = await ctx.db.get(userId);
+    if (user?.banned) {
       return { weakQuestions: [], page: 1, totalPages: 0, total: 0 };
     }
     const page = Math.max(1, args.page ?? 1);

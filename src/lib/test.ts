@@ -49,7 +49,8 @@ export type View =
   | "result"
   | "weak"
   | "analytics"
-  | "leaderboard";
+  | "leaderboard"
+  | "admin";
 
 export type TestMode = "normal" | "all" | "weak" | "hard";
 

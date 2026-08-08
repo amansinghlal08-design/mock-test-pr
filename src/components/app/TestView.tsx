@@ -9,7 +9,6 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
-import { AnimatePresence, motion } from "framer-motion";
 import { Check, Flag, Lightbulb, LogOut, X } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import type { ActiveTest } from "@/lib/test";
@@ -171,16 +170,11 @@ export function TestView({
         })}
       </div>
 
-      {/* Question card */}
-      <AnimatePresence mode="wait">
-        <motion.div
-          key={q.id}
-          initial={{ opacity: 0, x: 28 }}
-          animate={{ opacity: 1, x: 0 }}
-          exit={{ opacity: 0, x: -28 }}
-          transition={{ duration: 0.22, ease: "easeOut" }}
-          className="rounded-3xl border bg-card p-6 shadow-lg shadow-foreground/5 sm:p-8"
-        >
+      {/* Question card — static, zero animation during the active test */}
+      <div
+        key={q.id}
+        className="rounded-3xl border bg-card p-6 shadow-lg shadow-foreground/5 sm:p-8"
+      >
           <div className="flex flex-wrap items-center gap-2">
             <span className={`inline-flex items-center gap-1.5 rounded-full bg-gradient-to-r ${meta.gradient} px-3 py-1 text-xs font-bold text-white`}>
               {meta.emoji} {q.category}
@@ -201,21 +195,18 @@ export function TestView({
               const isCorrect = i === q.correct;
               const isChosen = answered === i;
               const revealed = answered !== null;
-              let cls = "border-input bg-background hover:border-primary hover:bg-primary/5";
-              if (revealed) {
-                if (isCorrect) cls = "border-emerald-500/60 bg-emerald-500/10";
-                else if (isChosen) cls = "border-rose-500/60 bg-rose-500/10";
-                else cls = "border-input bg-background opacity-60";
-              }
+              // Instant, static selection — only color/border swap, no motion.
+              let cls = "border-input bg-background";
+              if (!revealed) cls = "border-input bg-background hover:border-primary";
+              else if (isCorrect) cls = "border-emerald-500/60 bg-emerald-500/10";
+              else if (isChosen) cls = "border-rose-500/60 bg-rose-500/10";
+              else cls = "border-input bg-background opacity-50";
               return (
-                <motion.button
+                <button
                   key={i}
-                  initial={{ opacity: 0, y: 8 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ delay: i * 0.05 }}
                   disabled={revealed}
                   onClick={() => handleSelect(i)}
-                  className={`flex w-full items-center gap-3 rounded-2xl border-2 px-4 py-3.5 text-left text-sm font-semibold transition-all ${cls} disabled:cursor-default`}
+                  className={`flex w-full items-center gap-3 rounded-2xl border-2 px-4 py-3.5 text-left text-sm font-semibold ${cls} disabled:cursor-default`}
                 >
                   <span
                     className={`grid size-8 shrink-0 place-items-center rounded-lg text-xs font-extrabold transition-colors ${
@@ -245,26 +236,21 @@ export function TestView({
                       Wrong
                     </span>
                   )}
-                </motion.button>
+                </button>
               );
             })}
           </div>
 
           {answered !== null && q.explanation && (
-            <motion.div
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              className="mt-5 flex gap-3 rounded-2xl border-l-4 border-amber-400 bg-amber-500/8 p-4"
-            >
+            <div className="mt-5 flex gap-3 rounded-2xl border-l-4 border-amber-400 bg-amber-500/8 p-4">
               <Lightbulb className="mt-0.5 size-5 shrink-0 text-amber-500" />
               <div className="text-sm leading-relaxed">
                 <span className="font-extrabold">Explanation: </span>
                 {q.explanation}
               </div>
-            </motion.div>
+            </div>
           )}
-        </motion.div>
-      </AnimatePresence>
+        </div>
 
       {/* Nav buttons */}
       <div className="mt-6 flex items-center justify-between gap-3">
