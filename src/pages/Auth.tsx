@@ -15,12 +15,13 @@ import {
 } from "@/components/ui/input-otp";
 import { api } from "@/convex/_generated/api";
 import { useAuth } from "@/hooks/use-auth";
-import { useConvex } from "convex/react";
+import { useConvex, useMutation } from "convex/react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   ArrowLeft,
   ArrowRight,
   Flame,
+  KeyRound,
   Loader2,
   Lock,
   Mail,
@@ -49,11 +50,12 @@ function resolveRedirectAfterAuth(
   return fallback;
 }
 
-type Mode = "signIn" | "register";
+type Mode = "signIn" | "register" | "reset";
 
 function Auth({ redirectAfterAuth }: AuthProps = {}) {
   const { isLoading: authLoading, isAuthenticated, signIn } = useAuth();
   const convex = useConvex();
+  const resetPassword = useMutation(api.password.resetPassword);
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const redirect = resolveRedirectAfterAuth(
@@ -67,6 +69,7 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
   const [password, setPassword] = useState("");
   const [name, setName] = useState("");
   const [otp, setOtp] = useState("");
+  const [newPassword, setNewPassword] = useState("");
   const [demoOtp, setDemoOtp] = useState<string | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -159,6 +162,73 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
     }
   };
 
+  const handleResetRequest = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    setIsLoading(true);
+    setError(null);
+    const normalized = email.trim().toLowerCase();
+    try {
+      const exists = await convex.query(api.admin.emailExists, {
+        email: normalized,
+      });
+      if (!exists) {
+        setError("No account found for that email.");
+        setIsLoading(false);
+        return;
+      }
+      // Simulated reset code, shown in the UI (no real email is sent).
+      setDemoOtp(generateOtp());
+      setOtp("");
+      setNewPassword("");
+      setStep("otp");
+      setIsLoading(false);
+    } catch (error) {
+      console.error("Reset request error:", error);
+      setError("Could not start the reset. Please try again.");
+      setIsLoading(false);
+    }
+  };
+
+  const handleResetConfirm = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (otp !== demoOtp) {
+      setError("That code doesn't match. Try again.");
+      setOtp("");
+      return;
+    }
+    if (newPassword.length < 6) {
+      setError("New password must be at least 6 characters.");
+      return;
+    }
+    setIsLoading(true);
+    setError(null);
+    try {
+      const res = await resetPassword({
+        email: email.trim().toLowerCase(),
+        newPassword,
+      });
+      if (!res.ok) {
+        setError(res.error ?? "Could not reset the password.");
+        setIsLoading(false);
+        return;
+      }
+      toast.success("Password reset — sign in with your new password ✨");
+      setMode("signIn");
+      setStep("form");
+      setPassword("");
+      setNewPassword("");
+      setOtp("");
+      setDemoOtp(null);
+      setIsLoading(false);
+    } catch (error) {
+      console.error("Reset error:", error);
+      setError(
+        error instanceof Error ? error.message : "Could not reset the password.",
+      );
+      setIsLoading(false);
+    }
+  };
+
   const handleGuestLogin = async () => {
     setIsLoading(true);
     setError(null);
@@ -180,6 +250,7 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
     setStep("form");
     setDemoOtp(null);
     setOtp("");
+    setNewPassword("");
     setError(null);
   };
 
@@ -247,16 +318,30 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
                       </span>
                     </div>
                     <CardTitle className="text-2xl">
-                      {mode === "signIn" ? "Welcome back" : "Create your account"}
+                      {mode === "signIn"
+                        ? "Welcome back"
+                        : mode === "register"
+                          ? "Create your account"
+                          : "Reset your password"}
                     </CardTitle>
                     <CardDescription>
                       {mode === "signIn"
                         ? "Sign in with your email and password"
-                        : "It takes less than a minute — name, email & password"}
+                        : mode === "register"
+                          ? "It takes less than a minute — name, email & password"
+                          : "We'll send a code to your email to verify it's you"}
                     </CardDescription>
                   </CardHeader>
 
-                  <form onSubmit={mode === "signIn" ? handleLogin : handleRegisterForm}>
+                  <form
+                    onSubmit={
+                      mode === "signIn"
+                        ? handleLogin
+                        : mode === "register"
+                          ? handleRegisterForm
+                          : handleResetRequest
+                    }
+                  >
                     <CardContent className="space-y-3">
                       {mode === "register" && (
                         <div className="relative">
@@ -283,22 +368,36 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
                           required
                         />
                       </div>
-                      <div className="relative">
-                        <Lock className="absolute left-3 top-3 h-4 w-4 text-muted-foreground" />
-                        <Input
-                          value={password}
-                          onChange={(e) => setPassword(e.target.value)}
-                          placeholder={
-                            mode === "register"
-                              ? "Password (min 6 characters)"
-                              : "Password"
-                          }
-                          type="password"
-                          className="h-11 pl-9"
-                          disabled={isLoading}
-                          required
-                        />
-                      </div>
+                      {mode !== "reset" && (
+                        <div className="relative">
+                          <Lock className="absolute left-3 top-3 h-4 w-4 text-muted-foreground" />
+                          <Input
+                            value={password}
+                            onChange={(e) => setPassword(e.target.value)}
+                            placeholder={
+                              mode === "register"
+                                ? "Password (min 6 characters)"
+                                : "Password"
+                            }
+                            type="password"
+                            className="h-11 pl-9"
+                            disabled={isLoading}
+                            required
+                          />
+                        </div>
+                      )}
+
+                      {mode === "signIn" && (
+                        <div className="-mt-1 text-right">
+                          <button
+                            type="button"
+                            onClick={() => switchMode("reset")}
+                            className="text-xs font-bold text-primary hover:underline"
+                          >
+                            Forgot password?
+                          </button>
+                        </div>
+                      )}
 
                       {error && (
                         <p className="text-sm text-destructive">{error}</p>
@@ -315,9 +414,13 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
                           <>
                             Sign in <ArrowRight className="h-4 w-4" />
                           </>
-                        ) : (
+                        ) : mode === "register" ? (
                           <>
                             Continue <ArrowRight className="h-4 w-4" />
+                          </>
+                        ) : (
+                          <>
+                            <KeyRound className="h-4 w-4" /> Send reset code
                           </>
                         )}
                       </Button>
@@ -387,15 +490,21 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
                     <div className="mx-auto mb-3 grid size-12 place-items-center rounded-2xl bg-amber-500/10 text-amber-500">
                       <Sparkles className="size-6" />
                     </div>
-                    <CardTitle>Verify your email</CardTitle>
+                    <CardTitle>
+                      {mode === "reset" ? "Reset your password" : "Verify your email"}
+                    </CardTitle>
                     <CardDescription>
-                      We've sent a code to{" "}
+                      {mode === "reset" ? (
+                        <>A reset code is on its way to </>
+                      ) : (
+                        <>We've sent a code to </>
+                      )}
                       <span className="font-semibold text-foreground">
                         {email.trim().toLowerCase()}
                       </span>
                     </CardDescription>
                   </CardHeader>
-                  <form onSubmit={handleRegisterOtp}>
+                  <form onSubmit={mode === "reset" ? handleResetConfirm : handleRegisterOtp}>
                     <CardContent className="pb-4">
                       <div className="flex justify-center">
                         <InputOTP
@@ -429,6 +538,21 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
                         </div>
                       )}
 
+                      {mode === "reset" && (
+                        <div className="relative mt-3">
+                          <Lock className="absolute left-3 top-3 h-4 w-4 text-muted-foreground" />
+                          <Input
+                            value={newPassword}
+                            onChange={(e) => setNewPassword(e.target.value)}
+                            placeholder="New password (min 6 characters)"
+                            type="password"
+                            className="h-11 pl-9"
+                            disabled={isLoading}
+                            required
+                          />
+                        </div>
+                      )}
+
                       {error && (
                         <p className="mt-2 text-center text-sm text-destructive">
                           {error}
@@ -447,11 +571,11 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
                         {isLoading ? (
                           <>
                             <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                            Creating account…
+                            {mode === "reset" ? "Resetting…" : "Creating account…"}
                           </>
                         ) : (
                           <>
-                            Verify & create account
+                            {mode === "reset" ? "Reset password" : "Verify & create account"}
                             <ArrowRight className="ml-2 h-4 w-4" />
                           </>
                         )}
