@@ -11,6 +11,7 @@ Features
   * Weak-question tracking + Weak Practice / Hard Drill modes
   * Per-subject analytics + recent attempt history
   * Question bank management: bulk JSON import, export, delete
+  * GitHub backup bridge (sync.py) so data survives hosting resets
   * Light / dark theme, mobile friendly, keyboard shortcuts
 
 How to run
@@ -67,6 +68,13 @@ def _resolve_db_path():
 DB_PATH = _resolve_db_path()
 
 app = Flask(__name__)
+
+# Optional GitHub backup bridge (sync.py). If the file is missing or no
+# GitHub token is configured, the app runs exactly as before.
+try:
+    import sync  # noqa: F401
+except ImportError:
+    sync = None
 
 
 # =====================================================================
@@ -722,6 +730,27 @@ def export_all():
 
 
 # =====================================================================
+@app.route("/api/sync", methods=["POST"])
+def github_sync():
+    """Push or pull the question bank + user data via the sync.py bridge."""
+    data = request.get_json(force=True) or {}
+    action = data.get("action", "backup")
+    if data.get("password", "") != EXPORT_PASSWORD:
+        return jsonify(error="Invalid password"), 401
+    if sync is None or not sync.configured():
+        return jsonify(error="GitHub sync not configured. Set GITHUB_TOKEN and GITHUB_REPO in Render -> Environment."), 400
+    try:
+        if action == "backup":
+            result = sync.do_backup(force=True)
+        elif action == "restore":
+            result = sync.do_restore()
+        else:
+            return jsonify(error="Unknown action"), 400
+        return jsonify(status="ok", result=result)
+    except Exception as e:
+        return jsonify(error=str(e)), 500
+
+
 # FRONTEND (embedded single-file UI)
 # =====================================================================
 
@@ -1140,6 +1169,7 @@ kbd{font-family:var(--mono);font-size:.68rem;padding:2px 6px;border-radius:6px;b
     <button class="tab active" data-tab="bulk">📋 Bulk import</button>
     <button class="tab" data-tab="export">📥 Export</button>
     <button class="tab" data-tab="list">📜 All (<span id="qCount">0</span>)</button>
+    <button class="tab" data-tab="github">☁️ GitHub</button>
   </div>
   <div class="tab-panel active" id="tab-bulk">
     <div class="form-card">
@@ -1173,6 +1203,16 @@ kbd{font-family:var(--mono);font-size:.68rem;padding:2px 6px;border-radius:6px;b
       <button id="clearAllBtn" class="btn-danger">Clear all</button>
     </div>
     <div id="questionsList" class="questions-list"></div>
+  </div>
+  <div class="tab-panel" id="tab-github">
+    <div class="export-card">
+      <h3>☁️ GitHub backup</h3>
+      <p>Push the question bank and all user progress to your GitHub repo, or restore it after a fresh start. Requires the GITHUB_TOKEN and GITHUB_REPO environment variables.</p>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <button class="btn-primary" onclick="githubSync('backup')">☁️ Push backup</button>
+        <button class="btn-ghost" onclick="githubSync('restore')">⬇️ Restore from GitHub</button>
+      </div>
+    </div>
   </div>
 </div></section>
 
@@ -1750,6 +1790,23 @@ document.getElementById('exportPassword').addEventListener('keypress', e => { if
 document.getElementById('passwordModal').addEventListener('click', e => { if (e.target.id === 'passwordModal') closePasswordModal(); });
 document.getElementById('testConfigModal').addEventListener('click', e => { if (e.target.id === 'testConfigModal') closeTestConfig(); });
 
+// ---------- github sync ----------
+async function githubSync(action) {
+  const password = prompt('Enter the sync password:');
+  if (!password) return;
+  showLoading(true);
+  try {
+    const res = await fetch('/api/sync', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action, password }),
+    });
+    const d = await res.json();
+    if (!res.ok) { toast(d.error || 'Sync failed', 'error'); return; }
+    if (action === 'backup') toast('Pushed to GitHub ✓', 'success');
+    else toast('Restored from GitHub ✓', 'success');
+  } catch (e) { toast('Sync failed', 'error'); } finally { showLoading(false); }
+}
+
 // ---------- confetti ----------
 const canvas = document.getElementById('confetti');
 const ctx = canvas.getContext('2d');
@@ -1795,6 +1852,16 @@ function fireConfetti() {
 # Initialise the database on import so the app works under both
 # `python app.py` and `gunicorn app:app` (how Render starts the app).
 init_db()
+
+# Restore user data from the GitHub backup when this is a fresh database
+# (Render wipes /tmp on every restart; sync.py makes data survive it),
+# then push a backup so the newest state is never lost.
+if sync is not None and sync.configured():
+    try:
+        sync.restore_if_needed()
+        sync.do_backup(force=False)
+    except Exception as e:
+        print('GitHub sync skipped:', e)
 
 
 if __name__ == "__main__":
