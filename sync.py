@@ -34,7 +34,7 @@ import urllib.error
 import urllib.request
 
 BACKUP_DIR = "backup"
-SNAPSHOTS = ["questions", "attempts", "user_stats", "weak_questions"]
+SNAPSHOTS = ["questions", "users", "attempts", "user_stats", "weak_questions"]
 TIMEOUT = 20
 
 
@@ -94,9 +94,18 @@ CREATE TABLE IF NOT EXISTS user_stats (
     last_active INTEGER,
     level       INTEGER DEFAULT 1
 );
+CREATE TABLE IF NOT EXISTS users (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    username      TEXT UNIQUE NOT NULL,
+    first_name    TEXT NOT NULL,
+    last_name     TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    salt          TEXT NOT NULL,
+    created_at    INTEGER
+);
 """
 
-TABLES = ["questions", "attempts", "weak_questions", "user_stats"]
+TABLES = ["questions", "users", "attempts", "weak_questions", "user_stats"]
 
 
 def connect(path):

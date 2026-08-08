@@ -27,6 +27,8 @@ access code, defined privately in MASTER_CODE below.
 import json
 import os
 import random
+import re
+import secrets
 import sqlite3
 import time
 import hashlib
@@ -134,6 +136,24 @@ CREATE TABLE IF NOT EXISTS user_stats (
     last_active INTEGER,
     level       INTEGER DEFAULT 1
 );
+
+CREATE TABLE IF NOT EXISTS users (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    username      TEXT UNIQUE NOT NULL,
+    first_name    TEXT NOT NULL,
+    last_name     TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    salt          TEXT NOT NULL,
+    created_at    INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_users_name ON users(first_name, last_name);
+
+CREATE TABLE IF NOT EXISTS sessions (
+    token      TEXT PRIMARY KEY,
+    username   TEXT NOT NULL,
+    created_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(username);
 """
 
 
@@ -369,6 +389,146 @@ def update_user_stats(db, username, correct_count):
 
 
 # =====================================================================
+# AUTH  (registered users + persistent token sessions)
+# =====================================================================
+
+PBKDF2_ITERATIONS = 120000
+
+
+def hash_password(password, salt):
+    return hashlib.pbkdf2_hmac(
+        "sha256", password.encode("utf-8"), bytes.fromhex(salt), PBKDF2_ITERATIONS
+    ).hex()
+
+
+def verify_password(password, salt, expected_hash):
+    return secrets.compare_digest(hash_password(password, salt), expected_hash)
+
+
+def new_salt():
+    return secrets.token_hex(16)
+
+
+def sanitize_username(first_name, last_name):
+    base = re.sub(r"[^a-z0-9]+", "", (first_name + last_name).lower()) or "user"
+    return base[:24]
+
+
+def resolve_user(db, login):
+    """Find a user by username OR full name ("Rahul Sharma" / "rahulsharma")."""
+    key = (login or "").strip()
+    if not key:
+        return None
+    norm = key.lower().replace(" ", "")
+    return db.execute(
+        "SELECT * FROM users WHERE lower(username)=?"
+        " OR lower(first_name || ' ' || last_name)=?"
+        " OR lower(first_name || last_name)=?",
+        (key.lower(), key.lower(), norm),
+    ).fetchone()
+
+
+def auth_token():
+    auth = request.headers.get("Authorization", "")
+    if auth.startswith("Bearer "):
+        return auth[7:].strip()
+    return None
+
+
+def current_username():
+    """Resolve the authenticated username from the session token (or None)."""
+    token = auth_token()
+    if not token:
+        return None
+    with closing(get_db()) as db:
+        row = db.execute("SELECT username FROM sessions WHERE token=?", (token,)).fetchone()
+    return row["username"] if row else None
+
+
+def create_session(db, username):
+    token = secrets.token_hex(32)
+    db.execute(
+        "INSERT INTO sessions (token, username, created_at) VALUES (?,?,?)",
+        (token, username, int(time.time() * 1000)),
+    )
+    return token
+
+
+@app.route("/api/auth/register", methods=["POST"])
+def auth_register():
+    data = request.get_json(force=True) or {}
+    first = (data.get("first_name") or "").strip()
+    last = (data.get("last_name") or "").strip()
+    password = data.get("password") or ""
+    if not first or not last:
+        return jsonify(error="First name and last name are required."), 400
+    if len(password) < 4:
+        return jsonify(error="Password must be at least 4 characters."), 400
+
+    username = sanitize_username(first, last)
+    with closing(get_db()) as db:
+        candidate, n = username, 1
+        while db.execute("SELECT 1 FROM users WHERE username=?", (candidate,)).fetchone():
+            candidate = username + str(n)
+            n += 1
+        username = candidate
+        salt = new_salt()
+        db.execute(
+            "INSERT INTO users (username, first_name, last_name, password_hash, salt, created_at)"
+            " VALUES (?,?,?,?,?,?)",
+            (username, first, last, hash_password(password, salt), salt,
+             int(time.time() * 1000)),
+        )
+        token = create_session(db, username)
+        db.commit()
+    return jsonify(token=token, user={
+        "username": username, "first_name": first, "last_name": last,
+    })
+
+
+@app.route("/api/auth/login", methods=["POST"])
+def auth_login():
+    data = request.get_json(force=True) or {}
+    login = data.get("username") or data.get("full_name") or ""
+    password = data.get("password") or ""
+    with closing(get_db()) as db:
+        row = resolve_user(db, login)
+        if not row or not verify_password(password, row["salt"], row["password_hash"]):
+            return jsonify(error="Incorrect name or password."), 401
+        token = create_session(db, row["username"])
+        db.commit()
+    return jsonify(token=token, user={
+        "username": row["username"],
+        "first_name": row["first_name"], "last_name": row["last_name"],
+    })
+
+
+@app.route("/api/auth/me")
+def auth_me():
+    username = current_username()
+    if not username:
+        return jsonify(error="Not authenticated"), 401
+    with closing(get_db()) as db:
+        row = db.execute(
+            "SELECT username, first_name, last_name FROM users WHERE username=?", (username,)
+        ).fetchone()
+    if not row:
+        return jsonify(error="Not authenticated"), 401
+    return jsonify(username=row["username"],
+                   first_name=row["first_name"], last_name=row["last_name"])
+
+
+@app.route("/api/auth/logout", methods=["POST"])
+def auth_logout():
+    token = auth_token()
+    if token:
+        with closing(get_db()) as db:
+            db.execute("DELETE FROM sessions WHERE token=?", (token,))
+            db.commit()
+    return jsonify(status="ok")
+
+
+# =====================================================================
 # API ROUTES
 # =====================================================================
 
@@ -433,7 +593,7 @@ def get_tests():
 @app.route("/api/start-test", methods=["POST"])
 def start_test():
     data = request.get_json(force=True) or {}
-    username = (data.get("username") or "guest").strip()
+    username = current_username() or ""
     category = data.get("category")
     topic = data.get("topic")
     mode = data.get("mode", "chunk")
@@ -474,19 +634,30 @@ def start_test():
             ).fetchall()
             random.shuffle(rows)
             per_q = 30
-        elif mode in ("weak", "hard"):
+        elif mode in ("weak", "hard", "weak_cat"):
+            if not username:
+                return jsonify(error="Authentication required"), 401
             min_wrong = 2 if mode == "hard" else 1
-            rows = db.execute(
-                "SELECT q.* FROM questions q JOIN weak_questions w ON w.question_id=q.id"
-                " WHERE w.username=? AND w.wrong_count>=?",
-                (username, min_wrong),
-            ).fetchall()
+            sql = ("SELECT q.* FROM questions q JOIN weak_questions w ON w.question_id=q.id"
+                   " WHERE w.username=?")
+            params = [username]
+            if mode == "weak_cat" and category:
+                sql += " AND q.category=?"
+                params.append(category)
+            sql += " AND w.wrong_count>=?"
+            params.append(min_wrong)
+            rows = db.execute(sql, params).fetchall()
             if not rows:
-                msg = ("Nothing to drill yet — no questions missed twice." if mode == "hard"
-                       else "No weak questions yet — take a test first!")
+                if mode == "weak_cat" and category:
+                    msg = "No weak questions in " + category + " yet — take a test first!"
+                elif mode == "hard":
+                    msg = "Nothing to drill yet — no questions missed twice."
+                else:
+                    msg = "No weak questions yet — take a test first!"
                 return jsonify(error=msg), 404
             random.shuffle(rows)
-            rows = rows[:limit]
+            if limit > 0:
+                rows = rows[:limit]
             per_q = 60
         else:
             return jsonify(error="Unknown mode"), 400
@@ -505,7 +676,9 @@ def start_test():
 @app.route("/api/submit-test", methods=["POST"])
 def submit_test():
     data = request.get_json(force=True) or {}
-    username = (data.get("username") or "guest").strip()
+    username = current_username() or ""
+    if not username:
+        return jsonify(error="Authentication required"), 401
     answers = data.get("answers") or []
     category = data.get("category", "")
     topic = data.get("topic", "")
@@ -570,9 +743,9 @@ def submit_test():
 
 @app.route("/api/results")
 def recent_results():
-    username = request.args.get("username")
+    username = current_username()
     if not username:
-        return jsonify([])
+        return jsonify(error="Authentication required"), 401
     with closing(get_db()) as db:
         rows = db.execute(
             "SELECT * FROM attempts WHERE username=? ORDER BY ts DESC LIMIT 20", (username,)
@@ -587,10 +760,9 @@ def recent_results():
 
 @app.route("/api/stats")
 def user_stats():
-    username = request.args.get("username")
+    username = current_username()
     if not username:
-        return jsonify(total_questions=0, total_tests=0, avg_pct=0, weak_count=0,
-                       xp=0, level=1, streak=0, xp_into_level=0)
+        return jsonify(error="Authentication required"), 401
     with closing(get_db()) as db:
         total_q = db.execute("SELECT COUNT(*) AS n FROM questions").fetchone()["n"]
         attempts = db.execute(
@@ -602,19 +774,27 @@ def user_stats():
             "SELECT COUNT(*) AS n FROM weak_questions WHERE username=?", (username,)
         ).fetchone()["n"]
         row = db.execute("SELECT * FROM user_stats WHERE username=?", (username,)).fetchone()
+        weak_by_cat = {}
+        for wrow in db.execute(
+            "SELECT q.category AS category, COUNT(*) AS n FROM weak_questions w"
+            " JOIN questions q ON q.id=w.question_id WHERE w.username=? GROUP BY q.category",
+            (username,),
+        ).fetchall():
+            weak_by_cat[wrow["category"]] = wrow["n"]
     return jsonify(
         total_questions=total_q, total_tests=total_tests, avg_pct=avg_pct,
         weak_count=weak_count, xp=(row["xp"] if row else 0),
         level=(row["level"] if row else 1), streak=(row["streak"] if row else 0),
         xp_into_level=(row["xp"] % 100 if row else 0),
+        weak_by_category=weak_by_cat,
     )
 
 
 @app.route("/api/analytics")
 def user_analytics():
-    username = request.args.get("username")
+    username = current_username()
     if not username:
-        return jsonify([])
+        return jsonify(error="Authentication required"), 401
     with closing(get_db()) as db:
         rows = db.execute(
             "SELECT category, SUM(total) AS total, SUM(correct) AS correct, COUNT(*) AS tests"
@@ -632,8 +812,11 @@ def user_analytics():
     return jsonify(result)
 
 
-@app.route("/api/weak-questions/<username>")
-def weak_questions_paginated(username):
+@app.route("/api/weak-questions")
+def weak_questions_paginated():
+    username = current_username()
+    if not username:
+        return jsonify(error="Authentication required"), 401
     page = max(1, request.args.get("page", 1, type=int))
     page_size = 20
     offset = (page - 1) * page_size
@@ -660,6 +843,38 @@ def weak_questions_paginated(username):
             })
     return jsonify(weak_questions=result, page=page,
                    total_pages=max(1, -(-total // page_size)), total=total)
+
+
+@app.route("/api/leaderboard")
+def leaderboard():
+    """All registered players ranked by overall accuracy (then XP, then tests)."""
+    if not current_username():
+        return jsonify(error="Authentication required"), 401
+    with closing(get_db()) as db:
+        rows = db.execute(
+            "SELECT u.username, u.first_name, u.last_name,"
+            " COALESCE(s.xp,0) AS xp, COALESCE(s.level,1) AS level, COALESCE(s.streak,0) AS streak,"
+            " COUNT(a.id) AS tests,"
+            " COALESCE(SUM(a.correct),0) AS correct, COALESCE(SUM(a.total),0) AS answered"
+            " FROM users u"
+            " LEFT JOIN user_stats s ON s.username=u.username"
+            " LEFT JOIN attempts a ON a.username=u.username"
+            " GROUP BY u.username"
+            " ORDER BY (COALESCE(SUM(a.total),0)=0) ASC,"
+            " (COALESCE(SUM(a.correct),0)*1.0/MAX(COALESCE(SUM(a.total),0),1)) DESC,"
+            " COALESCE(s.xp,0) DESC, COUNT(a.id) DESC, u.username ASC"
+        ).fetchall()
+    result = []
+    for rank, r in enumerate(rows, start=1):
+        answered = r["answered"] or 0
+        accuracy = round((r["correct"] or 0) / answered * 100, 1) if answered else 0
+        result.append({
+            "rank": rank, "username": r["username"],
+            "first_name": r["first_name"], "last_name": r["last_name"],
+            "xp": r["xp"], "level": r["level"], "streak": r["streak"],
+            "tests": r["tests"], "accuracy": accuracy,
+        })
+    return jsonify(result)
 
 
 # ---------- question bank management ----------
@@ -896,6 +1111,7 @@ a{color:var(--brand);text-decoration:none}
 @keyframes lockPulse{0%,100%{box-shadow:0 0 0 0 rgba(99,102,241,.3)}50%{box-shadow:0 0 0 14px rgba(99,102,241,0)}}
 @keyframes drawCheck{to{stroke-dashoffset:0}}
 @keyframes badgePop{0%{transform:scale(.7);opacity:0}60%{transform:scale(1.08)}100%{transform:scale(1);opacity:1}}
+@keyframes authIn{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:none}}
 
 .bg-blob{position:fixed;border-radius:50%;filter:blur(90px);z-index:0;opacity:.4;pointer-events:none}
 .blob-1{width:340px;height:340px;background:#6366f1;top:-80px;left:-80px;animation:blob 13s infinite ease-in-out}
@@ -924,16 +1140,46 @@ a{color:var(--brand);text-decoration:none}
 .screen{display:none;padding:24px 0 90px}
 .screen.active{display:block;animation:screenIn .5s var(--ease)}
 
+/* ---------- premium auth ---------- */
+.auth-shell{width:100%;max-width:1060px;margin:0 auto;padding:36px 16px 56px;position:relative;z-index:2;display:grid;grid-template-columns:1fr;align-items:center;gap:36px;min-height:100vh}
+@media(min-width:920px){.auth-shell{grid-template-columns:1.05fr .95fr;gap:56px;padding:40px 24px 64px}}
+.auth-hero{animation:fadeInUp .6s var(--ease);text-align:center}
+@media(min-width:920px){.auth-hero{text-align:left}}
+.auth-brand{display:inline-flex;align-items:center;gap:10px;font-weight:800;font-size:1.25rem;letter-spacing:-.02em;margin-bottom:28px}
+.auth-title{font-size:clamp(2.2rem,5.5vw,3.4rem);font-weight:800;line-height:1.05;letter-spacing:-.03em;margin-bottom:16px}
+.auth-sub{color:var(--text2);font-size:.98rem;line-height:1.6;max-width:440px;margin:0 auto 28px}
+@media(min-width:920px){.auth-sub{margin:0 0 30px}}
+.auth-feats{display:flex;flex-direction:column;gap:10px;max-width:380px;margin:0 auto}
+@media(min-width:920px){.auth-feats{margin:0}}
+.auth-feat{display:flex;align-items:center;gap:12px;padding:12px 14px;border-radius:16px;background:var(--card);backdrop-filter:blur(16px);border:1px solid var(--line);box-shadow:var(--shadow);font-weight:600;font-size:.88rem;color:var(--text2);animation:fadeInUp .55s var(--ease) backwards}
+.auth-feat:nth-child(2){animation-delay:.1s}.auth-feat:nth-child(3){animation-delay:.2s}
+.auth-feat span{width:36px;height:36px;border-radius:12px;display:grid;place-items:center;background:var(--grad-brand);color:#fff;font-size:1.05rem;box-shadow:0 8px 18px -6px rgba(99,102,241,.55);flex-shrink:0}
+.auth-card-wrap{width:100%;max-width:460px;margin:0 auto}
+.auth-card{background:var(--card);backdrop-filter:blur(24px) saturate(1.7);-webkit-backdrop-filter:blur(24px) saturate(1.7);border:1px solid var(--line);border-radius:28px;padding:24px;box-shadow:var(--shadowLg);animation:modalIn .55s var(--pop)}
+.auth-tabs{position:relative;display:flex;background:var(--sunk);border-radius:14px;padding:4px;margin-bottom:18px}
+.auth-tab{flex:1;padding:12px 8px;border-radius:11px;font-weight:800;font-size:.88rem;color:var(--text2);position:relative;z-index:1;transition:color .35s var(--ease)}
+.auth-tab.active{color:var(--brand)}
+.auth-tab-pill{position:absolute;top:4px;bottom:4px;left:4px;width:calc(50% - 4px);background:var(--card);border-radius:11px;box-shadow:var(--shadowMd);transition:transform .5s var(--pop)}
+.auth-tabs.register .auth-tab-pill{transform:translateX(100%)}
+.auth-body{min-height:348px}
+.auth-pane{display:flex;flex-direction:column}
+.auth-pane.hidden{display:none}
+.auth-pane.enter{animation:authIn .45s var(--ease)}
+.auth-pane label{display:block;font-weight:700;font-size:.74rem;text-transform:uppercase;letter-spacing:.1em;color:var(--text2);margin:14px 0 7px}
+.auth-name-row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.auth-name-row label{margin-top:14px}
+.auth-error{color:var(--err);font-size:.8rem;font-weight:700;margin-top:12px;padding:9px 12px;background:var(--errsoft);border-radius:10px}
+.auth-hint{color:var(--muted);font-size:.76rem;margin-top:14px;line-height:1.5}
+.auth-submit{width:100%;justify-content:center;margin-top:20px;padding:14px;font-size:1rem}
+.auth-submit .ac-arrow{position:static;color:inherit;font-size:1rem;transition:transform .35s var(--ease)}
+.auth-submit:hover .ac-arrow{transform:translateX(5px)}
+.auth-foot{text-align:center;color:var(--muted);font-size:.74rem;margin-top:16px}
+
 .hero{max-width:620px;margin:0 auto;text-align:center;padding:40px 16px}
 .hero-tag{display:inline-flex;align-items:center;gap:8px;padding:6px 16px;border-radius:100px;background:var(--card);backdrop-filter:blur(14px);border:1px solid var(--line);font-size:.85rem;font-weight:600;color:var(--text2);margin-bottom:20px;box-shadow:var(--shadow)}
 .hero-title{font-size:clamp(2rem,7vw,3.2rem);font-weight:800;line-height:1.08;margin-bottom:12px;letter-spacing:-.03em}
 .grad-word{background:linear-gradient(100deg,var(--brand),var(--brand2),var(--accent));-webkit-background-clip:text;background-clip:text;-webkit-text-fill-color:transparent}
 .hero-sub{max-width:500px;margin:0 auto 24px;color:var(--text2);font-size:1rem}
-.name-card{background:var(--card);backdrop-filter:blur(20px) saturate(1.6);-webkit-backdrop-filter:blur(20px) saturate(1.6);border:1px solid var(--line);border-radius:22px;padding:24px;box-shadow:var(--shadowLg);text-align:left;margin-bottom:20px;transition:box-shadow .4s var(--ease),transform .4s var(--ease)}
-.name-card:hover{box-shadow:var(--shadowLg),0 0 0 1px rgba(99,102,241,.12);transform:translateY(-2px)}
-.name-card label{display:block;font-weight:700;margin-bottom:8px;color:var(--text2);text-transform:uppercase;font-size:.72rem;letter-spacing:.12em}
-.name-row{display:flex;gap:10px;flex-wrap:wrap}
-.name-hint{font-size:.74rem;color:var(--muted);margin-top:8px}
 
 .btn-primary{position:relative;overflow:hidden;display:inline-flex;align-items:center;gap:8px;justify-content:center;padding:13px 22px;border-radius:14px;background:var(--grad-brand);color:#fff;font-weight:700;font-size:.98rem;box-shadow:0 8px 20px -6px rgba(99,102,241,.5),0 2px 6px rgba(99,102,241,.25);transition:transform .35s var(--ease),box-shadow .35s var(--ease),filter .3s var(--ease),opacity .3s var(--ease)}
 .btn-primary::after{content:"";position:absolute;top:0;left:-80%;width:50%;height:100%;background:linear-gradient(100deg,transparent,rgba(255,255,255,.35),transparent);transform:skewX(-20deg);transition:left .65s var(--ease);pointer-events:none}
@@ -963,10 +1209,14 @@ a{color:var(--brand);text-decoration:none}
 .pc-left{position:relative;z-index:1}
 .pc-left h2{font-size:1.5rem;font-weight:800;margin-bottom:4px;letter-spacing:-.02em}
 .pc-left p{font-size:.82rem;color:rgba(255,255,255,.85)}
-.pc-right{text-align:center;position:relative;z-index:1}
+.pc-right{display:flex;align-items:center;gap:16px;text-align:left;position:relative;z-index:1}
+.pc-level{display:flex;flex-direction:column;align-items:center;gap:2px}
 .level-badge{width:64px;height:64px;border-radius:50%;background:rgba(255,255,255,.16);border:2px solid rgba(255,255,255,.5);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);display:grid;place-items:center;font-weight:800;font-size:1.5rem;box-shadow:inset 0 1px 0 rgba(255,255,255,.4);transition:transform .4s var(--pop)}
 .pc-right:hover .level-badge{transform:scale(1.06)}
 .pc-right span{font-size:.62rem;color:rgba(255,255,255,.85);text-transform:uppercase;letter-spacing:.08em}
+.lb-chip{background:rgba(255,255,255,.18);border:1px solid rgba(255,255,255,.38);backdrop-filter:blur(8px);color:#fff;padding:8px 14px;font-weight:800;font-size:.8rem;cursor:pointer;transition:transform .35s var(--ease),background .35s var(--ease),box-shadow .35s var(--ease)}
+.lb-chip:hover{transform:translateY(-2px) scale(1.05);background:rgba(255,255,255,.3);box-shadow:0 10px 24px -8px rgba(0,0,0,.4)}
+.lb-chip:active{transform:scale(.96)}
 .chip{display:inline-flex;align-items:center;gap:6px;border-radius:50px;padding:4px 12px;background:rgba(255,255,255,.16);backdrop-filter:blur(6px);border:1px solid rgba(255,255,255,.22);font-size:.76rem;font-weight:700;color:#fff}
 
 .quick-stats{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-bottom:20px}
@@ -1074,6 +1324,11 @@ a{color:var(--brand);text-decoration:none}
 .weak-q-item .wq-opt{padding:7px 9px;border-radius:10px;background:var(--sunk);border:1px solid var(--line);font-size:.8rem}
 .weak-q-item .wq-opt.correct{background:var(--oksoft);color:var(--ok);font-weight:700;border-color:transparent}
 .weak-q-item .wq-meta{font-size:.68rem;color:var(--muted);margin-top:8px}
+.weak-chips{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px}
+.weak-chip{display:inline-flex;align-items:center;gap:6px;padding:8px 14px;border-radius:50px;background:var(--card);border:1px solid var(--line);font-weight:700;font-size:.8rem;color:var(--text2);transition:all .3s var(--ease)}
+.weak-chip:hover{border-color:var(--brand);color:var(--brand);transform:translateY(-1px)}
+.weak-chip.active{background:var(--grad-brand);color:#fff;border-color:transparent;box-shadow:0 6px 16px -5px rgba(99,102,241,.55)}
+.weak-chip .n{opacity:.65;font-weight:800}
 .pagination{display:flex;gap:5px;justify-content:center;margin:20px 0;flex-wrap:wrap}
 .page-btn{padding:8px 14px;background:var(--card);border:1px solid var(--line);border-radius:10px;font-weight:700;font-size:.85rem;color:var(--text2);transition:all .3s var(--ease)}
 .page-btn:hover{border-color:var(--brand);color:var(--brand);transform:translateY(-1px)}
@@ -1144,6 +1399,33 @@ a{color:var(--brand);text-decoration:none}
 .toast.show{transform:translate(-50%,0);opacity:1}.toast.success{background:var(--grad-mint)}.toast.error{background:var(--grad-red)}
 #confetti{position:fixed;inset:0;pointer-events:none;z-index:99}
 kbd{font-family:var(--mono);font-size:.68rem;padding:2px 6px;border-radius:6px;border:1px solid var(--line);background:var(--sunk)}
+
+/* ---------- leaderboard ---------- */
+.lb-podium{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:20px}
+.lb-card{position:relative;border-radius:22px;padding:16px 10px;text-align:center;background:var(--card);backdrop-filter:blur(16px);border:1px solid var(--line);box-shadow:var(--shadowMd);animation:fadeInUp .5s var(--ease) backwards;transition:transform .35s var(--ease),box-shadow .35s var(--ease),border-color .35s var(--ease);overflow:hidden}
+.lb-card:hover{transform:translateY(-4px);box-shadow:var(--shadowLg)}
+.lb-card.first{background:linear-gradient(165deg,rgba(251,191,36,.2),var(--card) 65%);border-color:rgba(251,191,36,.45)}
+.lb-card.second{background:linear-gradient(165deg,rgba(148,163,184,.18),var(--card) 65%);border-color:rgba(148,163,184,.4)}
+.lb-card.third{background:linear-gradient(165deg,rgba(217,119,6,.14),var(--card) 65%);border-color:rgba(217,119,6,.35)}
+.lb-card.me{border-color:var(--brand);box-shadow:var(--shadowGlow)}
+.lb-medal{font-size:1.5rem;position:absolute;top:8px;right:10px}
+.lb-card .lb-avatar{width:54px;height:54px;font-size:1.1rem;margin:8px auto 10px}
+.lb-card .lb-name-t{display:block;font-weight:800;font-size:.92rem;letter-spacing:-.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.lb-card .lb-sub{color:var(--muted);font-size:.74rem;font-weight:700;margin-top:3px}
+.lb-list{display:grid;gap:8px}
+.lb-row{display:flex;align-items:center;gap:12px;padding:12px 16px;border-radius:16px;background:var(--card);backdrop-filter:blur(14px);border:1px solid var(--line);box-shadow:var(--shadow);transition:transform .3s var(--ease),box-shadow .3s var(--ease),border-color .3s var(--ease)}
+.lb-row:hover{transform:translateX(3px);box-shadow:var(--shadowMd)}
+.lb-row.me{border-color:rgba(99,102,241,.55);background:linear-gradient(90deg,rgba(99,102,241,.13),var(--card) 65%)}
+.lb-rank{width:34px;height:34px;border-radius:11px;display:grid;place-items:center;font-weight:800;font-size:.88rem;background:var(--sunk);color:var(--text2);flex-shrink:0}
+.lb-rank.top3{background:var(--grad-brand);color:#fff;box-shadow:0 4px 12px -3px rgba(99,102,241,.5)}
+.lb-avatar{width:40px;height:40px;border-radius:13px;display:grid;place-items:center;font-weight:800;color:#fff;flex-shrink:0;font-size:.85rem;box-shadow:0 6px 14px -5px rgba(23,27,60,.35)}
+.lb-name{flex:1;min-width:0}
+.lb-name b{font-size:.92rem;display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.lb-name small{color:var(--muted);font-size:.72rem}
+.lb-num{text-align:right}
+.lb-num b{font-size:.95rem}
+.lb-num small{display:block;color:var(--muted);font-size:.62rem;text-transform:uppercase;letter-spacing:.06em;font-weight:800}
+.lb-you{background:var(--grad-brand);color:#fff;font-size:.58rem;font-weight:800;padding:1px 7px;border-radius:20px;vertical-align:2px;margin-left:4px}
 
 .grid-2>*,.quick-stats>*,.subtopic-grid>*,.tests-list>*,.recent-list>*{animation:fadeInUp .5s var(--ease) backwards}
 .grid-2>*:nth-child(2),.quick-stats>*:nth-child(2),.subtopic-grid>*:nth-child(2),.tests-list>*:nth-child(2),.recent-list>*:nth-child(2){animation-delay:.05s}
@@ -1216,7 +1498,7 @@ kbd{font-family:var(--mono);font-size:.68rem;padding:2px 6px;border-radius:6px;b
   </div>
 </div>
 
-<header class="navbar"><div class="container nav-wrap">
+<header class="navbar" id="navbar"><div class="container nav-wrap">
   <a class="brand" href="#" onclick="nav('dashboard');return false;"><span class="brand-dot"></span>MockTest<span style="color:var(--accent)">.pro</span></a>
   <div class="nav-right">
     <span class="user-chip" id="userChip" hidden onclick="nav('analytics')"><span class="dot-live"></span><span id="userName"></span></span>
@@ -1224,22 +1506,61 @@ kbd{font-family:var(--mono);font-size:.68rem;padding:2px 6px;border-radius:6px;b
       <svg class="i-sun" width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
       <svg class="i-moon" width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
     </button>
+    <button id="logoutBtn" class="icon-btn" title="Sign out" onclick="logout()">
+      <svg width="19" height="19" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
+    </button>
   </div>
 </div></header>
 
-<section id="welcomeScreen" class="screen active"><div class="container hero">
-  <div class="hero-tag"><span class="dot-live"></span> Level 99 Edition · No signup needed</div>
-  <h1 class="hero-title">Practice <span class="grad-word">smart</span>,<br>score <span class="grad-word">higher</span>.</h1>
-  <p class="hero-sub">Enter your name, pick a subject, and take timed mock tests. Earn XP, keep your streak, and reach Level 99.</p>
-  <div class="name-card">
-    <label for="nameInput">Your name</label>
-    <div class="name-row">
-      <input id="nameInput" type="text" placeholder="e.g. Rahul Sharma" autocomplete="off">
-      <button id="startBtn" class="btn-primary">Enter ➜</button>
+<section id="authScreen" class="screen active">
+  <div class="auth-shell">
+    <div class="auth-hero">
+      <div class="auth-brand"><span class="brand-dot"></span>MockTest<span style="color:var(--accent)">.pro</span></div>
+      <h1 class="auth-title">Practice <span class="grad-word">smart</span>,<br>score <span class="grad-word">higher</span>.</h1>
+      <p class="auth-sub">Timed mock tests for GK, Maths, English, Reasoning &amp; Science. Earn XP, keep your streak, climb to Level 99 — your progress is saved to your account.</p>
+      <div class="auth-feats">
+        <div class="auth-feat"><span>⏱</span> Real exam pressure with auto-submit</div>
+        <div class="auth-feat"><span>🎯</span> Smart weak-spot quizzes &amp; hard drills</div>
+        <div class="auth-feat"><span>🏆</span> Global leaderboard rankings</div>
+      </div>
     </div>
-    <p class="name-hint">Your name is stored only in this browser — no account needed.</p>
+    <div class="auth-card-wrap">
+      <div class="auth-card">
+        <div class="auth-tabs" id="authTabs">
+          <div class="auth-tab-pill"></div>
+          <button class="auth-tab active" id="tabLogin" type="button" onclick="setAuthMode('login')">Sign in</button>
+          <button class="auth-tab" id="tabRegister" type="button" onclick="setAuthMode('register')">Create account</button>
+        </div>
+        <div class="auth-body">
+          <div class="auth-pane" id="loginPane">
+            <form id="loginForm" onsubmit="submitLogin(event)" autocomplete="on">
+              <label for="loginUser">Full name or username</label>
+              <input id="loginUser" type="text" placeholder="e.g. Rahul Sharma" autocomplete="username" autocapitalize="off" spellcheck="false" required>
+              <label for="loginPass">Password</label>
+              <input id="loginPass" type="password" placeholder="••••••••" autocomplete="current-password" required>
+              <p class="auth-error" id="loginError" hidden></p>
+              <button type="submit" class="btn-primary auth-submit" id="loginBtn">Sign in <span class="ac-arrow">→</span></button>
+            </form>
+          </div>
+          <div class="auth-pane hidden" id="registerPane">
+            <form id="registerForm" onsubmit="submitRegister(event)" autocomplete="on">
+              <div class="auth-name-row">
+                <div><label for="regFirst">First name</label><input id="regFirst" type="text" placeholder="Rahul" autocomplete="given-name" required></div>
+                <div><label for="regLast">Last name</label><input id="regLast" type="text" placeholder="Sharma" autocomplete="family-name" required></div>
+              </div>
+              <label for="regPass">Password</label>
+              <input id="regPass" type="password" placeholder="Create a password (min 4 characters)" autocomplete="new-password" required>
+              <p class="auth-hint">🔐 Your account permanently saves your results, XP, streaks and weak questions.</p>
+              <p class="auth-error" id="registerError" hidden></p>
+              <button type="submit" class="btn-primary auth-submit" id="registerBtn">Create my account <span class="ac-arrow">→</span></button>
+            </form>
+          </div>
+        </div>
+      </div>
+      <p class="auth-foot">100% free · No email needed · Data backed up to GitHub</p>
+    </div>
   </div>
-</div></section>
+</section>
 
 <section id="dashboardScreen" class="screen"><div class="container">
   <div class="profile-card">
@@ -1251,7 +1572,13 @@ kbd{font-family:var(--mono);font-size:.68rem;padding:2px 6px;border-radius:6px;b
         <span class="chip">💯 <span id="dashAvg">0</span>% avg</span>
       </div>
     </div>
-    <div class="pc-right"><div class="level-badge" id="dashLevelBig">1</div><span>Level</span></div>
+    <div class="pc-right">
+      <button class="chip lb-chip" onclick="nav('leaderboard')">🏆 Leaderboard</button>
+      <div class="pc-level">
+        <div class="level-badge" id="dashLevelBig">1</div>
+        <span>Level</span>
+      </div>
+    </div>
   </div>
   <div class="quick-stats" id="quickStats"></div>
   <div class="page-head"><div><p class="eyebrow">Actions</p><h2 class="page-title">What next?</h2></div></div>
@@ -1332,11 +1659,14 @@ kbd{font-family:var(--mono);font-size:.68rem;padding:2px 6px;border-radius:6px;b
 <section id="weaklistScreen" class="screen"><div class="container">
   <div class="page-head">
     <div><p class="eyebrow">Weak questions</p><h2 class="page-title">Weak spots 📚</h2></div>
-    <div style="display:flex;gap:8px">
-      <button class="btn-primary" onclick="openTestConfig('weak')">🔥 Practice weak</button>
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button class="btn-primary" id="weakPlayBtn" onclick="startWeakQuiz()">▶ Play weak quiz</button>
+      <button class="btn-ghost" onclick="openTestConfig('weak')">🔥 Practice weak</button>
+      <button class="btn-ghost" onclick="openTestConfig('hard')">💪 Hard drill</button>
       <button class="btn-ghost" onclick="nav('dashboard')">← Home</button>
     </div>
   </div>
+  <div id="weakChips" class="weak-chips"></div>
   <div id="weakListContainer"></div>
   <div class="pagination" id="weakPagination"></div>
 </div></section>
@@ -1360,6 +1690,13 @@ kbd{font-family:var(--mono);font-size:.68rem;padding:2px 6px;border-radius:6px;b
   </div>
   <div class="section-h">Category-wise accuracy</div>
   <div class="analytics-chart" id="analyticsChart"></div>
+</div></section>
+
+<section id="leaderboardScreen" class="screen"><div class="container">
+  <div class="page-head"><div><p class="eyebrow">Global rankings</p><h2 class="page-title">Leaderboard 🏆</h2></div><button class="btn-ghost" onclick="nav('dashboard')">← Home</button></div>
+  <p style="color:var(--text2);font-size:.85rem;margin-bottom:16px">All registered players, ranked by overall accuracy.</p>
+  <div id="lbPodium" class="lb-podium"></div>
+  <div id="lbTable" class="lb-list"></div>
 </div></section>
 
 <section id="manageScreen" class="screen"><div class="container">
@@ -1441,12 +1778,15 @@ kbd{font-family:var(--mono);font-size:.68rem;padding:2px 6px;border-radius:6px;b
 
 <script>
 const state = {
-  username: localStorage.getItem('mtp_user') || '',
+  token: localStorage.getItem('mtp_token') || '',
+  user: null,
+  username: '',
   currentCategory: '',
   currentTopic: '',
   currentTest: null,
   timerInt: null,
   weakPage: 1,
+  weakFilter: 'all',
   pendingConfig: null,
   pendingLock: null,
   lockedDest: '',
@@ -1483,6 +1823,121 @@ function playSound(type) {
 }
 function vibrate(ms) { if (navigator.vibrate) navigator.vibrate(ms); }
 
+// ---------- auth helpers ----------
+async function api(path, opts = {}) {
+  const headers = Object.assign({ 'Authorization': 'Bearer ' + (state.token || '') }, opts.headers || {});
+  const res = await fetch(path, Object.assign({}, opts, { headers }));
+  if (res.status === 401 && !opts.unauth) handleUnauth();
+  return res;
+}
+function handleUnauth() {
+  localStorage.removeItem('mtp_token');
+  state.token = '';
+  state.user = null;
+  state.username = '';
+  toast('Session expired — please sign in again', 'error');
+  showAuth();
+}
+function showAuth() {
+  clearInterval(state.timerInt);
+  state.currentTest = null;
+  document.getElementById('navbar').style.display = 'none';
+  document.getElementById('bottomNav').style.display = 'none';
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.getElementById('authScreen').classList.add('active');
+  setAuthMode('login');
+}
+function enterApp() {
+  document.getElementById('navbar').style.display = '';
+  document.getElementById('bottomNav').style.display = '';
+  document.getElementById('userChip').hidden = false;
+  document.getElementById('userName').textContent = state.user.first_name || state.user.username;
+  nav(window.location.hash.replace('#', '') || 'dashboard');
+}
+function setAuthMode(mode) {
+  const reg = mode === 'register';
+  document.getElementById('authTabs').classList.toggle('register', reg);
+  document.getElementById('tabLogin').classList.toggle('active', !reg);
+  document.getElementById('tabRegister').classList.toggle('active', reg);
+  const show = document.getElementById(reg ? 'registerPane' : 'loginPane');
+  const hide = document.getElementById(reg ? 'loginPane' : 'registerPane');
+  hide.classList.add('hidden');
+  show.classList.remove('hidden');
+  show.classList.remove('enter');
+  void show.offsetWidth;
+  show.classList.add('enter');
+  document.getElementById(reg ? 'regFirst' : 'loginUser').focus();
+}
+function setAuthBtn(btn, busy, label) {
+  btn.disabled = busy;
+  btn.innerHTML = busy ? '<span class="btn-spinner"></span> ' + label : label;
+}
+function authErr(id, msg) {
+  const el = document.getElementById(id);
+  el.textContent = msg;
+  el.hidden = false;
+}
+async function submitLogin(e) {
+  e.preventDefault();
+  const login = document.getElementById('loginUser').value.trim();
+  const pass = document.getElementById('loginPass').value;
+  const err = document.getElementById('loginError');
+  err.hidden = true;
+  if (!login || !pass) { authErr('loginError', 'Enter your full name (or username) and password.'); return; }
+  const btn = document.getElementById('loginBtn');
+  setAuthBtn(btn, true, 'Signing in…');
+  try {
+    const res = await fetch('/api/auth/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: login, password: pass }),
+    });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok) { authErr('loginError', d.error || 'Sign in failed.'); return; }
+    state.token = d.token;
+    localStorage.setItem('mtp_token', d.token);
+    state.user = d.user;
+    state.username = d.user.username;
+    toast('Welcome back, ' + (d.user.first_name || d.user.username) + '! 👋', 'success');
+    enterApp();
+  } catch (e2) { authErr('loginError', 'Could not reach the server.'); }
+  finally { setAuthBtn(btn, false, 'Sign in <span class="ac-arrow">→</span>'); }
+}
+async function submitRegister(e) {
+  e.preventDefault();
+  const first = document.getElementById('regFirst').value.trim();
+  const last = document.getElementById('regLast').value.trim();
+  const pass = document.getElementById('regPass').value;
+  const err = document.getElementById('registerError');
+  err.hidden = true;
+  if (!first || !last) { authErr('registerError', 'Enter your first and last name.'); return; }
+  if (pass.length < 4) { authErr('registerError', 'Password must be at least 4 characters.'); return; }
+  const btn = document.getElementById('registerBtn');
+  setAuthBtn(btn, true, 'Creating account…');
+  try {
+    const res = await fetch('/api/auth/register', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ first_name: first, last_name: last, password: pass }),
+    });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok) { authErr('registerError', d.error || 'Registration failed.'); return; }
+    state.token = d.token;
+    localStorage.setItem('mtp_token', d.token);
+    state.user = d.user;
+    state.username = d.user.username;
+    toast('Welcome, ' + d.user.first_name + '! 🎉', 'success');
+    enterApp();
+  } catch (e2) { authErr('registerError', 'Could not reach the server.'); }
+  finally { setAuthBtn(btn, false, 'Create my account <span class="ac-arrow">→</span>'); }
+}
+async function logout() {
+  try { await fetch('/api/auth/logout', { method: 'POST', headers: { 'Authorization': 'Bearer ' + state.token } }); } catch (e) {}
+  localStorage.removeItem('mtp_token');
+  state.token = '';
+  state.user = null;
+  state.username = '';
+  showAuth();
+}
+
 // ---------- navigation ----------
 function nav(screen) {
   history.pushState({}, '', '#' + screen);
@@ -1495,7 +1950,7 @@ window.addEventListener('popstate', () => {
 function renderScreen(id) {
   if (id === 'tests' && !state.currentTopic) id = 'topics';
   document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
-  const map = { welcome:'welcomeScreen', dashboard:'dashboardScreen', categories:'categoriesScreen', topics:'topicsScreen', tests:'testsScreen', test:'testScreen', result:'resultScreen', manage:'manageScreen', weaklist:'weaklistScreen', analytics:'analyticsScreen' };
+  const map = { auth:'authScreen', dashboard:'dashboardScreen', categories:'categoriesScreen', topics:'topicsScreen', tests:'testsScreen', test:'testScreen', result:'resultScreen', manage:'manageScreen', weaklist:'weaklistScreen', analytics:'analyticsScreen', leaderboard:'leaderboardScreen' };
   const el = document.getElementById(map[id]);
   if (el) el.classList.add('active');
   if (id === 'dashboard') renderDashboard();
@@ -1505,6 +1960,7 @@ function renderScreen(id) {
   if (id === 'manage') renderManage();
   if (id === 'weaklist') loadWeakList(1);
   if (id === 'analytics') renderAnalytics();
+  if (id === 'leaderboard') renderLeaderboard();
   document.querySelectorAll('.bottom-nav button').forEach(b => b.classList.toggle('active', b.dataset.nav === id));
   window.scrollTo(0, 0);
 }
@@ -1530,31 +1986,30 @@ applyTheme(localStorage.getItem('mtp_theme') || (window.matchMedia('(prefers-col
 function showLoading(show) { document.getElementById('loadingOverlay').classList.toggle('active', show); }
 function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c => ({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[c])); }
 
-// ---------- welcome ----------
-document.addEventListener('DOMContentLoaded', () => {
-  const enter = () => {
-    const val = document.getElementById('nameInput').value.trim();
-    if (!val) { toast('Please enter your name', 'error'); return; }
-    state.username = val;
-    localStorage.setItem('mtp_user', val);
-    document.getElementById('userChip').hidden = false;
-    document.getElementById('userName').textContent = val;
-    nav('dashboard');
-  };
-  document.getElementById('startBtn').addEventListener('click', enter);
-  document.getElementById('nameInput').addEventListener('keypress', e => { if (e.key === 'Enter') enter(); });
-  if (state.username) {
-    document.getElementById('userChip').hidden = false;
-    document.getElementById('userName').textContent = state.username;
-    renderScreen(window.location.hash.replace('#', '') || 'dashboard');
+// ---------- session bootstrap ----------
+document.addEventListener('DOMContentLoaded', async () => {
+  if (state.token) {
+    try {
+      const res = await fetch('/api/auth/me', { headers: { 'Authorization': 'Bearer ' + state.token } });
+      if (res.ok) {
+        const me = await res.json();
+        state.user = me;
+        state.username = me.username;
+        enterApp();
+        return;
+      }
+    } catch (e) {}
+    localStorage.removeItem('mtp_token');
+    state.token = '';
   }
+  showAuth();
 });
 
 // ---------- dashboard ----------
 async function renderDashboard() {
-  document.getElementById('helloName').textContent = state.username;
+  document.getElementById('helloName').textContent = (state.user && state.user.first_name) || state.username;
   try {
-    const stats = await (await fetch(`/api/stats?username=${encodeURIComponent(state.username)}`)).json();
+    const stats = await (await api('/api/stats')).json();
     document.getElementById('dashLevel').textContent = stats.level;
     document.getElementById('dashLevelBig').textContent = stats.level;
     document.getElementById('dashAvg').textContent = stats.avg_pct;
@@ -1577,7 +2032,7 @@ async function renderDashboard() {
   const rl = document.getElementById('recentList');
   rl.innerHTML = '<div class="skeleton-card"></div><div class="skeleton-card"></div>';
   try {
-    const res = await (await fetch(`/api/results?username=${encodeURIComponent(state.username)}`)).json();
+    const res = await (await api('/api/results')).json();
     if (!res.length) {
       rl.innerHTML = '<div class="empty">No tests yet — take your first one!</div>';
       return;
@@ -1692,15 +2147,18 @@ function startCustomTest() {
 async function startTest(cat, topic, mode, limit = 20, chunk = 1) {
   showLoading(true);
   try {
-    const res = await fetch('/api/start-test', {
+    const res = await api('/api/start-test', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: state.username, category: cat, topic, mode, limit, chunk }),
+      body: JSON.stringify({ category: cat, topic, mode, limit, chunk }),
     });
     const data = await res.json();
     if (!res.ok) { toast(data.error || 'Error', 'error'); return; }
     const isChunk = data.mode === 'chunk';
     const label = isChunk ? (topic || '') + ' · Test ' + (data.chunk || 1)
       : mode === 'full_topic' ? (topic || '') + ' · Full'
+      : mode === 'weak_cat' ? (cat || '') + ' · Weak quiz'
+      : mode === 'weak' ? 'Weak practice'
+      : mode === 'hard' ? 'Hard drill'
       : topic || cat || '';
     state.currentTest = {
       questions: data.questions,
@@ -1835,9 +2293,9 @@ async function submitTest(timeUp) {
   const timeSec = Math.floor((Date.now() - t.startAt) / 1000);
   showLoading(true);
   try {
-    const res = await fetch('/api/submit-test', {
+    const res = await api('/api/submit-test', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username: state.username, answers, time_sec: timeSec, category: t.category, topic: t.topic, mode: t.mode }),
+      body: JSON.stringify({ answers, time_sec: timeSec, category: t.category, topic: t.topic, mode: t.mode }),
     });
     const d = await res.json();
     document.getElementById('rCorrect').textContent = d.correct;
@@ -1904,12 +2362,21 @@ document.getElementById('retakeBtn').addEventListener('click', () => {
   const t = state.currentTest;
   if (!t) return;
   if (t.mode === 'weak' || t.mode === 'hard') openTestConfig(t.mode);
+  else if (t.mode === 'weak_cat') startTest(t.category, null, 'weak_cat', 0);
   else if (t.mode === 'chunk') startChunkTest(t.category, t.rawTopic, t.chunk);
   else if (t.mode === 'full_topic') startTest(t.category, t.rawTopic, 'full_topic', 0);
   else if (t.mode === 'all') startTest(t.category, null, 'all', 0);
 });
 
-// ---------- weak questions ----------
+// ---------- weak questions (bank + category quiz) ----------
+function setWeakFilter(cat) {
+  state.weakFilter = cat;
+  loadWeakList(1);
+}
+function startWeakQuiz() {
+  const cat = state.weakFilter === 'all' ? null : state.weakFilter;
+  startTest(cat, null, 'weak_cat', 0);
+}
 async function loadWeakList(page) {
   state.weakPage = page;
   const container = document.getElementById('weakListContainer');
@@ -1917,12 +2384,26 @@ async function loadWeakList(page) {
   container.innerHTML = '<div class="skeleton-card"></div><div class="skeleton-card"></div>';
   pagination.innerHTML = '';
   try {
-    const data = await (await fetch(`/api/weak-questions/${encodeURIComponent(state.username)}?page=${page}`)).json();
-    if (!data.weak_questions.length) {
-      container.innerHTML = '<div class="empty">🎉 No weak questions — amazing!</div>';
+    const stats = await (await api('/api/stats')).json();
+    const cats = stats.weak_by_category || {};
+    const counts = Object.entries(cats).sort((a, b) => b[1] - a[1]);
+    const total = counts.reduce((s, x) => s + x[1], 0);
+    document.getElementById('weakChips').innerHTML =
+      `<button class="weak-chip ${state.weakFilter === 'all' ? 'active' : ''}" onclick="setWeakFilter('all')">All <span class="n">${total}</span></button>` +
+      counts.map(([c, n]) => `<button class="weak-chip ${state.weakFilter === c ? 'active' : ''}" onclick="setWeakFilter('${esc(c)}')">${esc(c)} <span class="n">${n}</span></button>`).join('');
+    document.getElementById('weakPlayBtn').textContent =
+      state.weakFilter === 'all' ? '▶ Play weak quiz' : `▶ Play ${state.weakFilter} quiz`;
+  } catch (e) {}
+  try {
+    const data = await (await api(`/api/weak-questions?page=${page}`)).json();
+    const items = data.weak_questions.filter(w => state.weakFilter === 'all' || w.category === state.weakFilter);
+    if (!items.length) {
+      container.innerHTML = state.weakFilter === 'all'
+        ? '<div class="empty">🎉 No weak questions — amazing!</div>'
+        : `<div class="empty">No weak questions in ${esc(state.weakFilter)} — amazing! 🎉</div>`;
       return;
     }
-    container.innerHTML = data.weak_questions.map(w => `
+    container.innerHTML = items.map(w => `
       <div class="weak-q-item">
         <div class="wq-head"><div class="wq-q">${esc(w.question)}</div><span class="weak-count">❌ ${w.wrong_count}x</span></div>
         <div><span class="q-cat-top" style="font-size:.66rem">${esc(w.category)}${w.topic ? ' · ' + esc(w.topic) : ''}</span></div>
@@ -1942,7 +2423,7 @@ async function loadWeakList(page) {
 // ---------- analytics ----------
 async function renderAnalytics() {
   try {
-    const stats = await (await fetch(`/api/stats?username=${encodeURIComponent(state.username)}`)).json();
+    const stats = await (await api('/api/stats')).json();
     document.getElementById('analyticsLevel').textContent = stats.level;
     document.getElementById('analyticsXpText').textContent = `${stats.xp} XP · 🔥 ${stats.streak}-day streak`;
     document.getElementById('nextLevel').textContent = stats.level + 1;
@@ -1952,7 +2433,7 @@ async function renderAnalytics() {
   const chart = document.getElementById('analyticsChart');
   chart.innerHTML = '<div class="skeleton-card"></div>';
   try {
-    const res = await (await fetch(`/api/analytics?username=${encodeURIComponent(state.username)}`)).json();
+    const res = await (await api('/api/analytics')).json();
     if (!res.length) { chart.innerHTML = '<div class="empty">No data yet — finish a few tests first.</div>'; return; }
     chart.innerHTML = res.map(c => `
       <div class="bar-row">
@@ -1961,6 +2442,49 @@ async function renderAnalytics() {
       </div>`).join('');
     setTimeout(() => document.querySelectorAll('.bar-fill').forEach(b => { b.style.width = b.dataset.t + '%'; }), 120);
   } catch (e) { chart.innerHTML = '<div class="empty">Failed to load analytics.</div>'; }
+}
+
+// ---------- leaderboard ----------
+function lbInitials(r) {
+  const f = (r.first_name || '?').charAt(0).toUpperCase();
+  const l = (r.last_name || '').charAt(0).toUpperCase();
+  return (f + l).trim() || '?';
+}
+async function renderLeaderboard() {
+  const podium = document.getElementById('lbPodium');
+  const table = document.getElementById('lbTable');
+  podium.innerHTML = '<div class="skeleton-card"></div><div class="skeleton-card"></div><div class="skeleton-card"></div>';
+  table.innerHTML = '<div class="skeleton-card"></div>'.repeat(3);
+  try {
+    const rows = await (await api('/api/leaderboard')).json();
+    if (!rows.length) {
+      podium.innerHTML = '';
+      table.innerHTML = '<div class="empty">No players yet — be the first to finish a test! 🚀</div>';
+      return;
+    }
+    const avatars = ['g1', 'g2', 'g3', 'g4', 'g5', 'g6'];
+    const medals = ['🥇', '🥈', '🥉'];
+    const top3 = rows.slice(0, 3);
+    const order = [top3[1], top3[0], top3[2]].filter(Boolean);
+    podium.innerHTML = order.map(r => {
+      const cls = r.rank === 1 ? 'first' : r.rank === 2 ? 'second' : 'third';
+      return `<div class="lb-card ${cls} ${r.username === state.username ? 'me' : ''}">
+        <div class="lb-medal">${medals[r.rank - 1] || r.rank}</div>
+        <div class="lb-avatar ${avatars[r.rank % 6]}">${lbInitials(r)}</div>
+        <span class="lb-name-t">${esc(r.first_name + ' ' + r.last_name)}${r.username === state.username ? '<span class="lb-you">you</span>' : ''}</span>
+        <div class="lb-sub">${r.accuracy}% · Level ${r.level} · ${r.xp} XP</div>
+      </div>`;
+    }).join('');
+    const rest = rows.slice(3);
+    table.innerHTML = rest.length ? rest.map(r => `
+      <div class="lb-row ${r.username === state.username ? 'me' : ''}">
+        <div class="lb-rank">${r.rank}</div>
+        <div class="lb-avatar ${avatars[r.rank % 6]}">${lbInitials(r)}</div>
+        <div class="lb-name"><b>${esc(r.first_name + ' ' + r.last_name)}${r.username === state.username ? '<span class="lb-you">you</span>' : ''}</b><small>Level ${r.level} · ${r.tests} test${r.tests === 1 ? '' : 's'}</small></div>
+        <div class="lb-num"><b>${r.accuracy}%</b><small>accuracy</small></div>
+        <div class="lb-num"><b>${r.xp} XP</b><small>streak ${r.streak}🔥</small></div>
+      </div>`).join('') : '';
+  } catch (e) { podium.innerHTML = ''; table.innerHTML = '<div class="empty">Failed to load leaderboard.</div>'; }
 }
 
 // ---------- manage ----------
@@ -2271,7 +2795,8 @@ function fireConfetti() {
 }
 </script>
 </body>
-</html>"""
+</html>
+"""
 
 
 # Initialise the database on import so the app works under both
