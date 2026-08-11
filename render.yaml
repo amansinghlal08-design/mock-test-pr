@@ -1,0 +1,28 @@
+# Render blueprint — MockTest.pro
+#
+# Deploys the frontend as a FREE static site (always-on, no spin-down) that
+# talks to the Convex backend directly. No Node server is needed at runtime.
+#
+# To use: push this file to your GitHub repo, then in Render:
+#   New → Blueprint (or New → Static Site and paste these settings manually)
+# Render auto-detects this render.yaml and deploys.
+#
+# If the Convex deployment ever changes, update VITE_CONVEX_URL below — it is
+# baked into the bundle at build time.
+
+services:
+  - type: web
+    name: mocktest-pro
+    runtime: static
+    plan: free
+    buildCommand: npm install && npm run build
+    staticPublishPath: ./dist
+    envVars:
+      - key: VITE_CONVEX_URL
+        value: https://useful-puffin-512.convex.cloud
+    # SPA fallback: serve index.html for every path so deep links
+    # (e.g. /dashboard, /auth) work with client-side routing.
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
