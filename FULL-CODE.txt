@@ -25,7 +25,6 @@ package.json
 postcss.config.cjs
 public/logo.svg
 public/manifest.webmanifest
-requirements.txt
 src/assets/logo.svg
 src/components/LogoDropdown.tsx
 src/components/RequireAuth.tsx
@@ -149,9 +148,25 @@ CONVEX_DEPLOYMENT=
 ================================================================================
 FILE: .gitignore
 ================================================================================
-.env.local
+# Dependencies / build output
 node_modules
 dist
+
+# Local env (secrets)
+.env
+.env.local
+.env.*.local
+
+# Python leftovers (old Flask app — not part of MockTest.pro)
+__pycache__/
+*.pyc
+*.db
+app.py
+sync.py
+requirements.txt
+
+# Generated code dump (workflow artifact)
+FULL-CODE.txt
 
 ================================================================================
 FILE: .prettierignore
@@ -849,12 +864,6 @@ FILE: public/manifest.webmanifest
     }
   ]
 }
-
-================================================================================
-FILE: requirements.txt
-================================================================================
-flask>=3.0.0
-gunicorn>=21.2.0
 
 ================================================================================
 FILE: src/assets/logo.svg
@@ -15579,4 +15588,3 @@ for (const [name, content] of Object.entries(files)) {
   writeFileSync(join(outDir, name), content, "utf8");
 }
 console.log("OK generated");
-
