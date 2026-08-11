@@ -1,3 +1,19 @@
-.env.local
+# Dependencies / build output
 node_modules
 dist
+
+# Local env (secrets)
+.env
+.env.local
+.env.*.local
+
+# Python leftovers (old Flask app — not part of MockTest.pro)
+__pycache__/
+*.pyc
+*.db
+app.py
+sync.py
+requirements.txt
+
+# Generated code dump (workflow artifact)
+FULL-CODE.txt
