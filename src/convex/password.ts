@@ -24,8 +24,8 @@ export const resetPassword = mutation({
   handler: async (ctx, args) => {
     const email = args.email.trim().toLowerCase();
     if (!email) return { ok: false, error: "Enter your email address." };
-    if (!args.newPassword || args.newPassword.length < 6) {
-      return { ok: false, error: "Password must be at least 6 characters." };
+    if (!args.newPassword || args.newPassword.length < 8) {
+      return { ok: false, error: "Password must be at least 8 characters." };
     }
 
     // Find the email+password account row (created by the Password provider).

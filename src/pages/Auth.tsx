@@ -51,6 +51,25 @@ function resolveRedirectAfterAuth(
   return fallback;
 }
 
+/**
+ * The auth library throws plain Errors which Convex sanitizes into generic
+ * "Server Error" responses. Map those (and credential failures) to a friendly
+ * message instead of showing raw `[CONVEX ...] Server Error` text.
+ */
+function friendlyAuthError(error: unknown, fallback: string): string {
+  const message = error instanceof Error ? error.message : "";
+  const lower = message.toLowerCase();
+  if (
+    lower.includes("server error") ||
+    lower.includes("invalidsecret") ||
+    lower.includes("invalid credentials") ||
+    lower.includes("invalid password")
+  ) {
+    return "Incorrect email or password.";
+  }
+  return message || fallback;
+}
+
 type Mode = "signIn" | "register" | "reset";
 
 function Auth({ redirectAfterAuth }: AuthProps = {}) {
@@ -107,13 +126,15 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
         );
         return;
       }
-      await signIn("password", { email: normalized, password });
+      await signIn("password", {
+        flow: "signIn",
+        email: normalized,
+        password,
+      });
     } catch (error) {
       console.error("Login error:", error);
       setError(
-        error instanceof Error
-          ? error.message
-          : "Sign in failed. Check your email and password.",
+        friendlyAuthError(error, "Sign in failed. Check your email and password."),
       );
       setIsLoading(false);
     }
@@ -126,8 +147,8 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
       setError("Please enter your full name.");
       return;
     }
-    if (password.length < 6) {
-      setError("Password must be at least 6 characters.");
+    if (password.length < 8) {
+      setError("Password must be at least 8 characters.");
       return;
     }
     // Send a real 6-digit code to the user's email.
@@ -250,8 +271,8 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
       setOtp("");
       return;
     }
-    if (newPassword.length < 6) {
-      setError("New password must be at least 6 characters.");
+    if (newPassword.length < 8) {
+      setError("New password must be at least 8 characters.");
       return;
     }
     setIsLoading(true);
@@ -430,7 +451,7 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
                             onChange={(e) => setPassword(e.target.value)}
                             placeholder={
                               mode === "register"
-                                ? "Password (min 6 characters)"
+                                ? "Password (min 8 characters)"
                                 : "Password"
                             }
                             type="password"
@@ -597,7 +618,7 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
                           <Input
                             value={newPassword}
                             onChange={(e) => setNewPassword(e.target.value)}
-                            placeholder="New password (min 6 characters)"
+                            placeholder="New password (min 8 characters)"
                             type="password"
                             className="h-11 pl-9"
                             disabled={isLoading}
