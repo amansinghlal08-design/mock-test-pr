@@ -5,11 +5,12 @@ import { Scrypt } from "lucia";
 /**
  * Reset a user's password for the `password` provider.
  *
- * The reset code itself is simulated on the client (matching the app's
- * simulated OTP registration). The server's job here is to re-hash the new
- * password exactly like the Password provider does (scrypt via lucia) and
- * store it on the matching `authAccounts` row, then invalidate every existing
- * session so the old password stops working everywhere.
+ * The reset code is generated on the client and emailed to the user (see
+ * src/convex/otp.ts), then confirmed client-side before this mutation runs.
+ * The server's job here is to re-hash the new password exactly like the
+ * Password provider does (scrypt via lucia) and store it on the matching
+ * `authAccounts` row, then invalidate every existing session so the old
+ * password stops working everywhere.
  */
 export const resetPassword = mutation({
   args: {

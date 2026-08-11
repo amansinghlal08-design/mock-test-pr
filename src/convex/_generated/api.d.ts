@@ -12,6 +12,7 @@ import type * as admin from "../admin.js";
 import type * as auth from "../auth.js";
 import type * as auth_emailOtp from "../auth/emailOtp.js";
 import type * as http from "../http.js";
+import type * as otp from "../otp.js";
 import type * as password from "../password.js";
 import type * as queries from "../queries.js";
 import type * as seedData from "../seedData.js";
@@ -29,6 +30,7 @@ declare const fullApi: ApiFromModules<{
   auth: typeof auth;
   "auth/emailOtp": typeof auth_emailOtp;
   http: typeof http;
+  otp: typeof otp;
   password: typeof password;
   queries: typeof queries;
   seedData: typeof seedData;

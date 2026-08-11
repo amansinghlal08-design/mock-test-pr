@@ -15,7 +15,7 @@ import {
 } from "@/components/ui/input-otp";
 import { api } from "@/convex/_generated/api";
 import { useAuth } from "@/hooks/use-auth";
-import { useConvex, useMutation } from "convex/react";
+import { useAction, useConvex, useMutation } from "convex/react";
 import { AnimatePresence, motion } from "framer-motion";
 import {
   ArrowLeft,
@@ -25,6 +25,7 @@ import {
   Loader2,
   Lock,
   Mail,
+  RefreshCw,
   ShieldCheck,
   Sparkles,
   Timer,
@@ -56,6 +57,7 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
   const { isLoading: authLoading, isAuthenticated, signIn } = useAuth();
   const convex = useConvex();
   const resetPassword = useMutation(api.password.resetPassword);
+  const sendOtpEmail = useAction(api.otp.sendOtpEmail);
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
   const redirect = resolveRedirectAfterAuth(
@@ -80,7 +82,7 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
     }
   }, [authLoading, isAuthenticated, navigate, redirect]);
 
-  /** Random 6-digit code for the simulated OTP step. */
+  /** Random 6-digit code, emailed to the user for verification. */
   const generateOtp = () =>
     String(Math.floor(100000 + Math.random() * 900000));
 
@@ -117,7 +119,7 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
     }
   };
 
-  const handleRegisterForm = (event: React.FormEvent<HTMLFormElement>) => {
+  const handleRegisterForm = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setError(null);
     if (name.trim().length < 2) {
@@ -128,11 +130,56 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
       setError("Password must be at least 6 characters.");
       return;
     }
-    // Simulated OTP verification step.
-    const code = generateOtp();
-    setDemoOtp(code);
-    setOtp("");
-    setStep("otp");
+    // Send a real 6-digit code to the user's email.
+    setIsLoading(true);
+    try {
+      const code = generateOtp();
+      const res = await sendOtpEmail({
+        email: email.trim().toLowerCase(),
+        code,
+      });
+      if (!res.ok) {
+        setError(
+          res.error ?? "Could not send the verification code. Please try again.",
+        );
+        setIsLoading(false);
+        return;
+      }
+      setDemoOtp(code);
+      setOtp("");
+      setStep("otp");
+    } catch (e) {
+      console.error("Send OTP error:", e);
+      setError("Could not send the verification code. Please try again.");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  /** Re-send the current verification code to the user's email. */
+  const handleResendOtp = async () => {
+    setError(null);
+    setIsLoading(true);
+    try {
+      const code = generateOtp();
+      const res = await sendOtpEmail({
+        email: email.trim().toLowerCase(),
+        code,
+      });
+      if (!res.ok) {
+        setError(res.error ?? "Could not resend the code. Please try again.");
+        setIsLoading(false);
+        return;
+      }
+      setDemoOtp(code);
+      setOtp("");
+      toast.success("A new code was sent to your email ✉️");
+    } catch (e) {
+      console.error("Resend OTP error:", e);
+      setError("Could not resend the code. Please try again.");
+    } finally {
+      setIsLoading(false);
+    }
   };
 
   const handleRegisterOtp = async (event: React.FormEvent<HTMLFormElement>) => {
@@ -176,8 +223,15 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
         setIsLoading(false);
         return;
       }
-      // Simulated reset code, shown in the UI (no real email is sent).
-      setDemoOtp(generateOtp());
+      // Send a real 6-digit reset code to the user's email.
+      const code = generateOtp();
+      const res = await sendOtpEmail({ email: normalized, code });
+      if (!res.ok) {
+        setError(res.error ?? "Could not send the reset code. Please try again.");
+        setIsLoading(false);
+        return;
+      }
+      setDemoOtp(code);
       setOtp("");
       setNewPassword("");
       setStep("otp");
@@ -528,12 +582,11 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
                       </div>
 
                       {demoOtp && (
-                        <div className="mt-4 rounded-xl border border-dashed border-amber-400/50 bg-amber-500/8 p-3 text-center">
-                          <p className="text-[11px] font-bold uppercase tracking-wide text-amber-600 dark:text-amber-400">
-                            Demo mode — simulated code
-                          </p>
-                          <p className="mt-1 font-mono text-2xl font-black tracking-[0.35em]">
-                            {demoOtp}
+                        <div className="mt-4 flex items-center gap-2.5 rounded-xl border border-emerald-500/40 bg-emerald-500/10 px-3.5 py-2.5">
+                          <Mail className="size-4 shrink-0 text-emerald-500" />
+                          <p className="text-xs font-semibold text-emerald-700 dark:text-emerald-400">
+                            A 6-digit code was sent to your email — check your
+                            inbox (and spam folder).
                           </p>
                         </div>
                       )}
@@ -559,7 +612,7 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
                         </p>
                       )}
                       <p className="mt-3 text-center text-xs text-muted-foreground">
-                        No real email is sent — this is a simulated verification.
+                        Didn't get it? Check spam, or resend the code below.
                       </p>
                     </CardContent>
                     <CardFooter className="flex-col gap-2">
@@ -579,6 +632,15 @@ function Auth({ redirectAfterAuth }: AuthProps = {}) {
                             <ArrowRight className="ml-2 h-4 w-4" />
                           </>
                         )}
+                      </Button>
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        onClick={handleResendOtp}
+                        disabled={isLoading}
+                        className="w-full"
+                      >
+                        <RefreshCw className="mr-2 h-4 w-4" /> Resend code
                       </Button>
                       <Button
                         type="button"
