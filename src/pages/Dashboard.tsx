@@ -171,6 +171,9 @@ export default function Dashboard() {
           answers: t.questions.map((q, i) => ({
             questionId: q.id,
             selected: t.answers[i],
+            // Echo the shuffled correct index so scoring matches the order the
+            // user saw (options are shuffled per test in startTest).
+            correct: q.correct,
           })),
           category: t.category,
           topic: t.topic,

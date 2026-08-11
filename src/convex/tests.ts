@@ -217,6 +217,9 @@ export const submitTest = mutation({
       v.object({
         questionId: v.id("questions"),
         selected: v.union(v.number(), v.null()),
+        // Shuffled correct index from the startTest payload (optional for
+        // backward compatibility with in-flight tests).
+        correct: v.optional(v.number()),
       }),
     ),
     category: v.optional(v.string()),
@@ -261,7 +264,13 @@ export const submitTest = mutation({
         )
         .first();
 
-      if (a.selected === q.correct) {
+      // Options are shuffled per test (see shuffleOptions in startTest), so the
+      // client's `selected` index refers to the shuffled order. The client also
+      // echoes the shuffled `correct` index it received, so compare those
+      // directly — comparing against the DB's original index scores shuffled
+      // questions wrong.
+      const right = a.correct !== undefined ? a.correct : q.correct;
+      if (a.selected === right) {
         correct++;
         // Hard-drill success on a repeat offender clears it back to one miss.
         if (args.mode === "hard" && weak && weak.wrongCount >= 2) {
